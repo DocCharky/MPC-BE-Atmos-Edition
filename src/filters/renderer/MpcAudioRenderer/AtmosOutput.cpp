@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 
 // ---- thdatmos.dll ----
 namespace
@@ -49,6 +51,7 @@ namespace
 			}
 			hLib = LoadLibraryW(path);
 			if (!hLib) {
+				AtmosLog(L"thdatmos.dll introuvable ou illisible : %s (erreur %u)", path, GetLastError());
 				return false;
 			}
 			create = (PFN_thd_create)GetProcAddress(hLib, "thd_create");
@@ -57,8 +60,11 @@ namespace
 			pull   = (PFN_thd_pull)GetProcAddress(hLib, "thd_pull");
 			close  = (PFN_thd_close)GetProcAddress(hLib, "thd_close");
 			if (!create || !reset || !push || !pull || !close) {
+				AtmosLog(L"thdatmos.dll : fonctions manquantes");
 				FreeLibrary(hLib);
 				hLib = nullptr;
+			} else {
+				AtmosLog(L"thdatmos.dll chargee : %s", path);
 			}
 			return hLib != nullptr;
 		}
@@ -113,6 +119,35 @@ namespace
 	const Kernel g_kernel;
 }
 
+void AtmosLog(const wchar_t* fmt, ...)
+{
+	static std::mutex s_logMutex;
+	static wchar_t s_path[MAX_PATH] = {};
+	std::lock_guard<std::mutex> lock(s_logMutex);
+	if (!s_path[0]) {
+		HMODULE hSelf = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+						   (LPCWSTR)&s_moduleAnchor, &hSelf);
+		GetModuleFileNameW(hSelf, s_path, MAX_PATH);
+		if (wchar_t* p = wcsrchr(s_path, L'\\')) {
+			wcscpy_s(p + 1, MAX_PATH - (p + 1 - s_path), L"atmos.log");
+		}
+	}
+	FILE* f = nullptr;
+	if (_wfopen_s(&f, s_path, L"a, ccs=UTF-8") != 0 || !f) {
+		return;
+	}
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+	fwprintf(f, L"%02u:%02u:%02u.%03u  ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+	va_list ap;
+	va_start(ap, fmt);
+	vfwprintf(f, fmt, ap);
+	va_end(ap);
+	fwprintf(f, L"\n");
+	fclose(f);
+}
+
 CAtmosOutput::CAtmosOutput()
 {
 	m_hStopEvent  = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -137,15 +172,18 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 		return S_OK;
 	}
 	if (!pDevice || !LibraryAvailable()) {
+		AtmosLog(L"Open : pas de peripherique ou pas de thdatmos.dll");
 		return E_FAIL;
 	}
 
 	HRESULT hr = pDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&m_pClient);
 	if (FAILED(hr)) {
+		AtmosLog(L"Open : ISpatialAudioClient indisponible (0x%08x)", hr);
 		return hr;
 	}
 	hr = m_pClient->IsSpatialAudioStreamAvailable(__uuidof(ISpatialAudioObjectRenderStream), nullptr);
 	if (FAILED(hr)) {
+		AtmosLog(L"Open : aucun format spatial actif (0x%08x)", hr);
 		Close();
 		return hr;
 	}
@@ -153,7 +191,9 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	UINT32 maxDyn = 0;
 	m_pClient->GetMaxDynamicObjectCount(&maxDyn);
 	m_nMaxDynamic = std::min<UINT32>(maxDyn, 16);
+	AtmosLog(L"Open : %u objets dynamiques disponibles", maxDyn);
 	if (m_nMaxDynamic < 15) { // une piste Atmos de Blu-ray compte jusqu'à 15 objets + LFE
+		AtmosLog(L"Open : pas assez d'objets dynamiques");
 		Close();
 		return E_FAIL;
 	}
@@ -167,6 +207,7 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	wf.nAvgBytesPerSec = SAMPLE_RATE * 4;
 	hr = m_pClient->IsAudioObjectFormatSupported(&wf);
 	if (FAILED(hr)) {
+		AtmosLog(L"Open : format 48 kHz float refuse (0x%08x)", hr);
 		Close();
 		return hr;
 	}
@@ -189,12 +230,14 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	act.blob.pBlobData = (BYTE*)&p;
 	hr = m_pClient->ActivateSpatialAudioStream(&act, __uuidof(ISpatialAudioObjectRenderStream), (void**)&m_pStream);
 	if (FAILED(hr)) {
+		AtmosLog(L"Open : ActivateSpatialAudioStream a echoue (0x%08x)", hr);
 		Close();
 		return hr;
 	}
 
 	hr = m_pStream->GetService(__uuidof(IAudioClock), (void**)&m_pAudioClock);
 	if (FAILED(hr)) {
+		AtmosLog(L"Open : IAudioClock indisponible (0x%08x)", hr);
 		Close();
 		return hr;
 	}
@@ -204,9 +247,11 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	ResetEvent(m_hStopEvent);
 	hr = m_pStream->Start();
 	if (FAILED(hr)) {
+		AtmosLog(L"Open : Start a echoue (0x%08x)", hr);
 		Close();
 		return hr;
 	}
+	AtmosLog(L"Open : flux spatial ouvert");
 	m_hThread = CreateThread(nullptr, 0, ThreadProc, this, 0, nullptr);
 
 	return S_OK;
@@ -268,6 +313,11 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 	}
 
 	if (!g_thd.push(m_pDecoder, pData, (size_t)size)) {
+		static int s_badLogged = 0;
+		if (s_badLogged++ < 3) {
+			AtmosLog(L"Receive : salve non reconnue (%ld octets, debut %02x %02x %02x %02x %02x)", size,
+					 size > 0 ? pData[0] : 0, size > 1 ? pData[1] : 0, size > 2 ? pData[2] : 0, size > 3 ? pData[3] : 0, size > 4 ? pData[4] : 0);
+		}
 		return S_FALSE; // pas du TrueHD emballé
 	}
 

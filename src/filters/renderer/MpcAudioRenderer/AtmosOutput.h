@@ -29,6 +29,9 @@
 #include <mutex>
 #include <vector>
 
+// Journal de diagnostic : atmos.log, a cote du module (.ax).
+void AtmosLog(const wchar_t* fmt, ...);
+
 class CAtmosOutput
 {
 public:
