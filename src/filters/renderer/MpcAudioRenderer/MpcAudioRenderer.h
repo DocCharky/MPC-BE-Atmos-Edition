@@ -29,6 +29,7 @@
 #include "AudioTools/Filter.h"
 #include "AudioTools/DitherInt16.h"
 #include "AudioSyncClock.h"
+#include "AtmosOutput.h"
 #include "DSUtil/Packet.h"
 #include <ExtLib/libbs2b/bs2bclass.h>
 
@@ -78,6 +79,14 @@ class __declspec(uuid("601D2A2B-9CDE-40bd-8650-0485E3522727"))
 	bool              m_bs2b_active;
 
 	BOOL              m_bDVDPlayback;
+
+	// Atmos Edition : TrueHD decode et joue en objets par Windows Spatial Sound
+	CAtmosOutput      m_Atmos;
+	bool              m_bAtmos = false;
+	HANDLE            m_hAtmosAbort = nullptr;
+	bool    IsTrueHDBitstream(const WAVEFORMATEX* pwfx) const;
+	bool    AtmosSupported();
+	HRESULT TransformAtmos(IMediaSample* pMediaSample);
 
 public:
 	CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr);

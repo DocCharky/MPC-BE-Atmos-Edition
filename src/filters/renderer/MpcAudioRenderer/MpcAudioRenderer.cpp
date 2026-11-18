@@ -347,6 +347,13 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	}
 
 	m_pSyncClock = DNew CAudioSyncClock(GetOwner(), &hr);
+
+	m_hAtmosAbort = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	m_Atmos.OnClockOffset = [this](REFERENCE_TIME delta) {
+		if (m_pSyncClock) {
+			m_pSyncClock->OffsetAudioClock(delta);
+		}
+	};
 	if (phr) {
 		*phr = hr;
 	}
@@ -373,6 +380,12 @@ CMpcAudioRenderer::~CMpcAudioRenderer()
 	m_pMMDeviceEnumerator->UnregisterEndpointNotificationCallback(this);
 
 	EndReleaseTimer();
+
+	if (m_hAtmosAbort) {
+		SetEvent(m_hAtmosAbort);
+	}
+	m_Atmos.Close();
+	SAFE_CLOSE_HANDLE(m_hAtmosAbort);
 
 	m_pSyncClock->UnSlave();
 	SAFE_DELETE(m_pSyncClock);
@@ -433,6 +446,10 @@ HRESULT	CMpcAudioRenderer::CheckMediaType(const CMediaType *pmt)
 		// Check S/PDIF & HDMI Bitstream
 		const WAVEFORMATEX *pWaveFormatEx = (WAVEFORMATEX*)pmt->pbFormat;
 		const BOOL bIsBitstreamInput = IsBitstream(pWaveFormatEx);
+		if (bIsBitstreamInput && IsTrueHDBitstream(pWaveFormatEx) && AtmosSupported()) {
+			DLog(L"CMpcAudioRenderer::CheckMediaType() - TrueHD accepted for Atmos object output");
+			return S_OK;
+		}
 		if (bIsBitstreamInput) {
 			hr = CreateAudioClient();
 			if (FAILED(hr)) {
@@ -547,6 +564,39 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 	}
 
 	HRESULT hr = S_OK;
+
+	if (IsTrueHDBitstream(pwf) && AtmosSupported()) {
+		// Atmos Edition : on libere la sortie WASAPI (le flux spatial passe par le moteur partage)
+		m_pSyncClock->UnSlave();
+		PauseRendererThread();
+		{
+			CAutoLock cRenderLock(&m_csRender);
+			if (m_bIsAudioClientStarted && m_pAudioClient) {
+				m_pAudioClient->Stop();
+			}
+			m_bIsAudioClientStarted = false;
+			SAFE_RELEASE(m_pRenderClient);
+			SAFE_RELEASE(m_pAudioClock);
+			SAFE_RELEASE(m_pAudioClient);
+			WasapiFlush();
+		}
+
+		hr = m_Atmos.Open(m_pMMDevice);
+		if (SUCCEEDED(hr)) {
+			DLog(L"CMpcAudioRenderer::SetMediaType() : TrueHD -> Atmos objects (%u dynamic objects)", m_Atmos.GetDynamicObjectCount());
+			m_bAtmos = true;
+			m_Atmos.SetVolume((float)m_dVolumeFactor);
+			CopyWaveFormat(pwf, &m_pWaveFormatExInput);
+			m_BitstreamMode = BITSTREAM_TRUEHD;
+			return CBaseRenderer::SetMediaType(pmt);
+		}
+		DLog(L"CMpcAudioRenderer::SetMediaType() : Atmos output failed (0x%08x), fallback to bitstream", hr);
+		hr = S_OK;
+	}
+	if (m_bAtmos) {
+		m_Atmos.Close();
+		m_bAtmos = false;
+	}
 
 	if (!m_pAudioClient) {
 		hr = CreateAudioClient();
@@ -780,6 +830,15 @@ STDMETHODIMP CMpcAudioRenderer::Run(REFERENCE_TIME rtStart)
 		NewSegment();
 	}
 
+	if (m_bAtmos) {
+		ResetEvent(m_hAtmosAbort);
+		m_Atmos.SetRunning(true);
+		if (m_Atmos.GetAudioClock() && !m_pSyncClock->IsSlave()) {
+			m_pSyncClock->Slave(m_Atmos.GetAudioClock(), m_rtStartTime + m_Atmos.GetCurrentRenderedTime());
+		}
+		return CBaseRenderer::Run(rtStart);
+	}
+
 	{
 		CAutoLock cCheckLock(&m_csCheck);
 		if (m_pAudioClock && !m_pSyncClock->IsSlave()) {
@@ -796,6 +855,10 @@ STDMETHODIMP CMpcAudioRenderer::Stop()
 	DLog(L"CMpcAudioRenderer::Stop()");
 
 	m_pSyncClock->UnSlave();
+	if (m_bAtmos) {
+		m_Atmos.SetRunning(false);
+		SetEvent(m_hAtmosAbort);
+	}
 
 	const auto bNeedStartReleaseTimer = m_filterState == State_Running;
 
@@ -816,6 +879,10 @@ STDMETHODIMP CMpcAudioRenderer::Pause()
 	DLog(L"CMpcAudioRenderer::Pause()");
 
 	m_pSyncClock->UnSlave();
+	if (m_bAtmos) {
+		m_Atmos.SetRunning(false);
+		ResetEvent(m_hAtmosAbort);
+	}
 
 	const auto bNeedStartReleaseTimer = m_filterState == State_Running;
 
@@ -846,6 +913,8 @@ STDMETHODIMP CMpcAudioRenderer::put_Volume(long lVolume)
 		m_lVolume = lVolume;
 		m_dVolumeFactor = pow(10.0, m_lVolume / 2000.0);
 	}
+
+	m_Atmos.SetVolume((float)m_dVolumeFactor);
 
 	if (m_lBalance > DSBPAN_LEFT && m_lBalance < DSBPAN_RIGHT) {
 		m_dBalanceFactor = m_dVolumeFactor * pow(10.0, -labs(m_lBalance) / 2000.0);
@@ -1469,6 +1538,10 @@ HRESULT CMpcAudioRenderer::Transform(IMediaSample *pMediaSample)
 #if defined(DEBUG_OR_LOG) && DBGLOG_LEVEL > 1
 	DLog(L"CMpcAudioRenderer::Transform()");
 #endif
+
+	if (m_bAtmos) {
+		return TransformAtmos(pMediaSample);
+	}
 
 	if (m_filterState == State_Stopped
 			|| !m_hRenderThread) {
@@ -2863,6 +2936,11 @@ HRESULT CMpcAudioRenderer::ReinitializeAudioDevice(BOOL bFullInitialization/* = 
 {
 	DLog(L"CMpcAudioRenderer::ReinitializeAudioDevice()");
 
+	if (m_bAtmos) {
+		m_bNeedReinitialize = m_bNeedReinitializeFull = FALSE;
+		return S_OK;
+	}
+
 	PauseRendererThread();
 
 	CAutoLock cRenderLock(&m_csRender);
@@ -3180,6 +3258,11 @@ HRESULT CMpcAudioRenderer::EndFlush()
 
 	FlushAudioFilter();
 
+	if (m_bAtmos) {
+		m_Atmos.Flush();
+		ResetEvent(m_hAtmosAbort);
+	}
+
 	HRESULT hr = CBaseRenderer::EndFlush();
 
 	m_FlushEvent.Reset();
@@ -3211,6 +3294,10 @@ void CMpcAudioRenderer::Flush()
 
 	m_FlushEvent.Set();
 	m_bFlushing = TRUE;
+
+	if (m_bAtmos) {
+		SetEvent(m_hAtmosAbort);
+	}
 }
 
 size_t CMpcAudioRenderer::WasapiQueueSize()
@@ -3220,6 +3307,13 @@ size_t CMpcAudioRenderer::WasapiQueueSize()
 
 void CMpcAudioRenderer::WaitFinish()
 {
+	if (m_bAtmos) {
+		while (m_filterState != State_Stopped && !m_bFlushing && m_Atmos.QueuedSamples()) {
+			Sleep(10);
+		}
+		return;
+	}
+
 	if (!m_bIsBitstream && m_input_params.samplerate != m_output_params.samplerate) {
 		int out_samples = m_Resampler.CalcOutSamples(0);
 		if (out_samples > 0 && m_pWaveFormatExOutput) {
@@ -3487,4 +3581,68 @@ STDMETHODIMP CMpcAudioRendererInputPin::EndFlush()
 	DLog(L"CMpcAudioRendererInputPin::EndFlush()");
 
 	return CRendererInputPin::EndFlush();
+}
+
+// ==== Atmos Edition ====
+
+bool CMpcAudioRenderer::IsTrueHDBitstream(const WAVEFORMATEX* pwfx) const
+{
+	if (pwfx && IsWaveFormatExtensible(pwfx)) {
+		const WAVEFORMATEXTENSIBLE* wfex = (const WAVEFORMATEXTENSIBLE*)pwfx;
+		return wfex->SubFormat == KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP;
+	}
+	return false;
+}
+
+bool CMpcAudioRenderer::AtmosSupported()
+{
+	if (!CAtmosOutput::LibraryAvailable()) {
+		return false;
+	}
+	if (!m_pMMDevice && FAILED(GetAudioDevice(FALSE))) {
+		return false;
+	}
+	if (!m_pMMDevice) {
+		return false;
+	}
+	CComPtr<ISpatialAudioClient> pSpatial;
+	if (FAILED(m_pMMDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&pSpatial))) {
+		return false;
+	}
+	return SUCCEEDED(pSpatial->IsSpatialAudioStreamAvailable(__uuidof(ISpatialAudioObjectRenderStream), nullptr));
+}
+
+HRESULT CMpcAudioRenderer::TransformAtmos(IMediaSample* pMediaSample)
+{
+	if (m_filterState == State_Stopped) {
+		return S_FALSE;
+	}
+
+	const long lSize = pMediaSample->GetActualDataLength();
+	if (!lSize) {
+		return S_FALSE;
+	}
+
+	REFERENCE_TIME rtStart, rtStop;
+	if (FAILED(pMediaSample->GetTime(&rtStart, &rtStop))) {
+		rtStart = rtStop = INVALID_TIME;
+	}
+	if (rtStart < 0 && rtStart != INVALID_TIME) {
+		return S_FALSE;
+	}
+
+	BYTE* pData = nullptr;
+	HRESULT hr = pMediaSample->GetPointer(&pData);
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	const bool bDiscontinuity = (S_OK == pMediaSample->IsDiscontinuity());
+	hr = m_Atmos.Receive(pData, lSize, rtStart == INVALID_TIME ? m_rtLastReceivedSampleTimeEnd : rtStart,
+						 bDiscontinuity, m_hAtmosAbort, nullptr);
+	if (rtStop != INVALID_TIME) {
+		m_rtLastReceivedSampleTimeEnd = rtStop;
+	}
+
+	return hr;
 }

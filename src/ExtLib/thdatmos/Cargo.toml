@@ -1,0 +1,19 @@
+[package]
+name = "thdatmos"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Real-time TrueHD Atmos decoding for MPC-BE Atmos Edition (based on truehdd)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+truehd = { git = "https://github.com/truehdd/truehdd", rev = "d14ceb35f68074eeb3e52beb5d2a10314b2e2adb" }
+matroska-demuxer = "0.7"
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"

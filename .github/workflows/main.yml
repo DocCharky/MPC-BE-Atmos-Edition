@@ -1,6 +1,7 @@
 name: Build MPC-BE
 
 on:
+  workflow_dispatch:
   push:
     paths-ignore:
       - .github/workflows/main.yml
@@ -45,14 +46,22 @@ jobs:
           .\\update_gcc.bat
         shell: pwsh
 
+      - name: Build thdatmos (TrueHD Atmos decoder)
+        run: |
+          rustup update stable
+          cargo build --release --manifest-path src/ExtLib/thdatmos/Cargo.toml
+          New-Item -ItemType Directory -Force -Path distrib/thdatmos/x64 | Out-Null
+          Copy-Item src/ExtLib/thdatmos/target/release/thdatmos.dll distrib/thdatmos/x64/thdatmos.dll
+        shell: pwsh
+
       - name: Clean
         run: |
-          .\\build.bat Clean All NoWait
+          .\\build.bat Clean x64 NoWait
         shell: pwsh
 
       - name: Build MPC-BE
         run: |
-          .\\build.bat Build Packages NoWait
+          .\\build.bat Build x64 Packages NoWait
         shell: pwsh
 
       - name: Upload Installer x64
@@ -68,17 +77,8 @@ jobs:
           name: "Zip x64" 
           path: _bin/Packages/**/MPC-BE*.x64.7z
           compression-level: 0
-
-      - name: Upload Installer x86
+      - name: Upload thdatmos.dll
         uses: actions/upload-artifact@v7
         with:
-          name: "Installer x86" 
-          path: _bin/Packages/**/MPC-BE*.x86-installer.zip
-          compression-level: 0
-
-      - name: Upload Zip x86
-        uses: actions/upload-artifact@v7
-        with:
-          name: "Zip x86" 
-          path: _bin/Packages/**/MPC-BE*.x86.7z
-          compression-level: 0
+          name: "thdatmos"
+          path: distrib/thdatmos/x64/thdatmos.dll

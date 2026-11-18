@@ -436,6 +436,7 @@ IF /I "%NAME%" == "MPC-BE" (
   IF /I "%ARCH%" == "x64" (
     COPY /Y /V "%~1_%ARCH%\mpc-be64.exe"                   "%PCKG_NAME%\mpc-be64.exe" >NUL
     COPY /Y /V "%~1_%ARCH%\MPCBEShellExt64.dll"            "%PCKG_NAME%\MPCBEShellExt64.dll" >NUL
+    IF EXIST "..\distrib\thdatmos\x64\thdatmos.dll" COPY /Y /V "..\distrib\thdatmos\x64\thdatmos.dll" "%PCKG_NAME%\thdatmos.dll" >NUL
     COPY /Y /V "..\distrib\MPC_components\DirectX\x64\d3dcompiler_47.dll" "%PCKG_NAME%\d3dcompiler_47.dll" >NUL
     COPY /Y /V "..\distrib\MPC_components\DirectX\x64\d3dx9_43.dll"       "%PCKG_NAME%\d3dx9_43.dll" >NUL
     COPY /Y /V "..\distrib\VisualElements\mpc-be64.VisualElementsManifest.xml" "%PCKG_NAME%" >NUL
