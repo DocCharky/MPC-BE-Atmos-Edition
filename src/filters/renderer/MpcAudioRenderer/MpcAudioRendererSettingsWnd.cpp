@@ -99,6 +99,8 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 	p.y += h20;
 	m_cbPauseKeepActive.Create(ResStr(IDS_ARS_PAUSE_KEEP_ACTIVE), dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_PAUSE_KEEP_ACTIVE);
 	p.y += h20;
+	m_cbAtmosObjects.Create(L"TrueHD : d\u00e9coder et envoyer en objets Atmos (Windows)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_ATMOS_OBJECTS);
+	p.y += h20;
 	p.x += ScaleX(240);
 	m_btnReset.Create(ResStr(IDS_FILTER_RESET_SETTINGS), dwStyle | BS_MULTILINE, CRect(p, CSize(ScaleX(80), ScaleX(32))), this, IDC_PP_RESET);
 
@@ -142,6 +144,7 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 		m_cbUseCrossFeed.SetCheck(m_pMAR->GetCrossFeed());
 		m_cbDummyChannels.SetCheck(m_pMAR->GetDummyChannels());
 		m_cbPauseKeepActive.SetCheck(m_pMAR->GetPauseKeepActive());
+		m_cbAtmosObjects.SetCheck(m_pMAR->GetAtmosObjects());
 	}
 
 	for (CWnd* pWnd = GetWindow(GW_CHILD); pWnd; pWnd = pWnd->GetNextWindow()) {
@@ -182,6 +185,7 @@ bool CMpcAudioRendererSettingsWnd::OnApply()
 		m_pMAR->SetCrossFeed(m_cbUseCrossFeed.GetCheck());
 		m_pMAR->SetDummyChannels(m_cbDummyChannels.GetCheck());
 		m_pMAR->SetPauseKeepActive(m_cbPauseKeepActive.GetCheck());
+		m_pMAR->SetAtmosObjects(m_cbAtmosObjects.GetCheck());
 		int idx = m_cbSoundDevice.GetCurSel();
 		if (idx >= 0) {
 			m_pMAR->SetDeviceId(m_deviceList[idx].deviceId, m_deviceList[idx].deviceName);
@@ -238,6 +242,7 @@ void CMpcAudioRendererSettingsWnd::OnBnClickedReset()
 	m_cbUseCrossFeed.SetCheck(BST_UNCHECKED);
 	m_cbDummyChannels.SetCheck(BST_UNCHECKED);
 	m_cbPauseKeepActive.SetCheck(BST_UNCHECKED);
+	m_cbAtmosObjects.SetCheck(BST_CHECKED);
 
 	OnClickedWasapiMode();
 

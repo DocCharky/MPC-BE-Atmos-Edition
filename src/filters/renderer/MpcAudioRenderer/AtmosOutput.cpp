@@ -21,6 +21,8 @@ namespace
 	typedef int   (*PFN_thd_pull)(void*, CAtmosOutput::Frame*);
 	typedef void  (*PFN_thd_close)(void*);
 
+	static int s_moduleAnchor = 0;
+
 	struct ThdLib {
 		HMODULE hLib = nullptr;
 		bool tried = false;
@@ -36,7 +38,11 @@ namespace
 			}
 			tried = true;
 			wchar_t path[MAX_PATH] = {};
-			GetModuleFileNameW(nullptr, path, MAX_PATH);
+			// thdatmos.dll est cherchee a cote du module qui contient ce code (.ax ou .exe).
+			HMODULE hSelf = nullptr;
+			GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+							   (LPCWSTR)&s_moduleAnchor, &hSelf);
+			GetModuleFileNameW(hSelf, path, MAX_PATH);
 			if (wchar_t* p = wcsrchr(path, L'\\')) {
 				wcscpy_s(p + 1, MAX_PATH - (p + 1 - path), L"thdatmos.dll");
 			}

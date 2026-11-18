@@ -25,7 +25,7 @@
 #include "IMpcAudioRenderer.h"
 #include "resource.h"
 
-class __declspec(uuid("1E53BA32-3BCC-4dff-9342-34E46BE3F5A5"))
+class __declspec(uuid("AFE02678-E9E0-4863-834D-C9CA0162D848"))
 	CMpcAudioRendererSettingsWnd : public CInternalPropertyPageWnd
 {
 private :
@@ -48,6 +48,7 @@ private :
 	CButton		m_cbUseCrossFeed;
 	CButton		m_cbDummyChannels;
 	CButton		m_cbPauseKeepActive;
+	CButton		m_cbAtmosObjects;
 	CButton		m_btnReset;
 
 	CStatic		m_txtSoundDevice;
@@ -65,6 +66,7 @@ private :
 		IDC_PP_USE_CROSSFEED,
 		IDC_PP_DUMMY_CHANNELS,
 		IDC_PP_PAUSE_KEEP_ACTIVE,
+		IDC_PP_ATMOS_OBJECTS,
 		IDC_PP_RESET,
 	};
 
@@ -78,7 +80,7 @@ public:
 	bool OnApply();
 
 	static LPCWSTR GetWindowTitle() { return MAKEINTRESOURCEW(IDS_FILTER_SETTINGS_CAPTION); }
-	static CSize GetWindowSize() { return CSize(340, 231); }
+	static CSize GetWindowSize() { return CSize(340, 251); }
 
 	DECLARE_MESSAGE_MAP()
 
@@ -91,7 +93,7 @@ public:
 };
 
 
-class __declspec(uuid("E3D0704B-1579-4E9E-8674-2674CB90D07A"))
+class __declspec(uuid("86250695-9DE3-4BE3-AE8F-FD5734AA0F6D"))
 	CMpcAudioRendererStatusWnd : public CInternalPropertyPageWnd
 {
 private :

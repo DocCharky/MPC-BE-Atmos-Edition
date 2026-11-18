@@ -34,8 +34,8 @@
 #include "filters/transform/MpaDecFilter/MpaDecFilter.h"
 
 // option names
-#define OPT_REGKEY_AudRend          L"Software\\MPC-BE Filters\\MPC Audio Renderer"
-#define OPT_SECTION_AudRend         L"Filters\\MPC Audio Renderer"
+#define OPT_REGKEY_AudRend          L"Software\\MPC-BE Filters\\MPC Audio Renderer Atmos"
+#define OPT_SECTION_AudRend         L"Filters\\MPC Audio Renderer Atmos"
 #define OPT_DeviceMode              L"DeviceMode"
 #define OPT_WasapiMethod            L"WasapiMethod"
 #define OPT_BufferDuration          L"BufferDuration"
@@ -48,6 +48,7 @@
 #define OPT_UseCrossFeed            L"CrossFeed"
 #define OPT_DummyChannels           L"DummyChannels"
 #define OPT_PauseKeepActive         L"PauseKeepActive"
+#define OPT_AtmosObjects            L"AtmosObjects"
 // TODO: rename option values
 
 // set to 1(or more) to enable more detail debug log
@@ -268,6 +269,9 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_PauseKeepActive, dw)) {
 			m_bPauseKeepActive = !!dw;
 		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_AtmosObjects, dw)) {
+			m_bAtmosObjects = !!dw;
+		}
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -283,6 +287,7 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_UseCrossFeed, m_bUseCrossFeed);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_DummyChannels, m_bDummyChannels);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_PauseKeepActive, m_bPauseKeepActive);
+	profile.ReadInt(OPT_SECTION_AudRend, OPT_AtmosObjects, m_bAtmosObjects);
 #endif
 
 	if (m_DeviceMode != MODE_WASAPI_EXCLUSIVE) {
@@ -1206,6 +1211,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 		key.SetDWORDValue(OPT_UseCrossFeed, m_bUseCrossFeed);
 		key.SetDWORDValue(OPT_DummyChannels, m_bDummyChannels);
 		key.SetDWORDValue(OPT_PauseKeepActive, m_bPauseKeepActive);
+		key.SetDWORDValue(OPT_AtmosObjects, m_bAtmosObjects);
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -1221,6 +1227,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_UseCrossFeed, m_bUseCrossFeed);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_DummyChannels, m_bDummyChannels);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_PauseKeepActive, m_bPauseKeepActive);
+	profile.WriteInt(OPT_SECTION_AudRend, OPT_AtmosObjects, m_bAtmosObjects);
 #endif
 
 	return S_OK;
@@ -3594,9 +3601,22 @@ bool CMpcAudioRenderer::IsTrueHDBitstream(const WAVEFORMATEX* pwfx) const
 	return false;
 }
 
+STDMETHODIMP CMpcAudioRenderer::SetAtmosObjects(BOOL bValue)
+{
+	CAutoLock cAutoLock(&m_csProps);
+	m_bAtmosObjects = bValue;
+	return S_OK;
+}
+
+STDMETHODIMP_(BOOL) CMpcAudioRenderer::GetAtmosObjects()
+{
+	CAutoLock cAutoLock(&m_csProps);
+	return m_bAtmosObjects;
+}
+
 bool CMpcAudioRenderer::AtmosSupported()
 {
-	if (!CAtmosOutput::LibraryAvailable()) {
+	if (!m_bAtmosObjects || !CAtmosOutput::LibraryAvailable()) {
 		return false;
 	}
 	if (!m_pMMDevice && FAILED(GetAudioDevice(FALSE))) {

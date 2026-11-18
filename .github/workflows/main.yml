@@ -56,29 +56,20 @@ jobs:
 
       - name: Clean
         run: |
-          .\\build.bat Clean x64 NoWait
+          .\\build.bat Clean x64 Filters NoWait
         shell: pwsh
 
-      - name: Build MPC-BE
+      - name: Build MPC Audio Renderer Atmos
         run: |
-          .\\build.bat Build x64 Packages NoWait
+          .\\build.bat Build x64 Filters NoWait
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item _bin/Filters_x64/MpcAudioRendererAtmos.ax out/
+          Copy-Item distrib/thdatmos/x64/thdatmos.dll out/
+          Copy-Item distrib/atmos/*.bat out/
         shell: pwsh
 
-      - name: Upload Installer x64
+      - name: Upload renderer
         uses: actions/upload-artifact@v7
         with:
-          name: "Installer x64" 
-          path: _bin/Packages/**/MPC-BE*.x64-installer.zip
-          compression-level: 0
-
-      - name: Upload Zip x64
-        uses: actions/upload-artifact@v7
-        with:
-          name: "Zip x64" 
-          path: _bin/Packages/**/MPC-BE*.x64.7z
-          compression-level: 0
-      - name: Upload thdatmos.dll
-        uses: actions/upload-artifact@v7
-        with:
-          name: "thdatmos"
-          path: distrib/thdatmos/x64/thdatmos.dll
+          name: "MPC Audio Renderer Atmos x64"
+          path: out/*

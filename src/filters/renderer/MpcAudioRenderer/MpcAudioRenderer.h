@@ -35,13 +35,13 @@
 
 #include <optional>
 
-#define MpcAudioRendererName L"MPC Audio Renderer"
+#define MpcAudioRendererName L"MPC Audio Renderer Atmos"
 
 // if you get a compilation error on AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED,
 // uncomment the #define below
 // #define AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED	AUDCLNT_ERR(0x019)
 
-class __declspec(uuid("601D2A2B-9CDE-40bd-8650-0485E3522727"))
+class __declspec(uuid("32F9FD04-2C8B-4F3B-98F2-9EB7F0888A11"))
 	CMpcAudioRenderer final
 	: public CBaseRenderer
 	, public IBasicAudio
@@ -83,6 +83,7 @@ class __declspec(uuid("601D2A2B-9CDE-40bd-8650-0485E3522727"))
 	// Atmos Edition : TrueHD decode et joue en objets par Windows Spatial Sound
 	CAtmosOutput      m_Atmos;
 	bool              m_bAtmos = false;
+	BOOL              m_bAtmosObjects = TRUE; // option : TrueHD -> objets Atmos
 	HANDLE            m_hAtmosAbort = nullptr;
 	bool    IsTrueHDBitstream(const WAVEFORMATEX* pwfx) const;
 	bool    AtmosSupported();
@@ -201,6 +202,8 @@ public:
 	STDMETHODIMP                  SetPauseKeepActive(BOOL bValue) override;
 	STDMETHODIMP_(BOOL)           GetPauseKeepActive() override;
 	STDMETHODIMP_(float)          GetLowLatencyMS() override;
+	STDMETHODIMP                  SetAtmosObjects(BOOL bValue) override;
+	STDMETHODIMP_(BOOL)           GetAtmosObjects() override;
 
 	// CMpcAudioRenderer
 private:
