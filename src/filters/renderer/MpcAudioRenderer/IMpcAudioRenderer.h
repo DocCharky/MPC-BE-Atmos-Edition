@@ -78,4 +78,7 @@ public IUnknown {
 	STDMETHOD_(float, GetLowLatencyMS()) PURE;
 	STDMETHOD(SetAtmosObjects(BOOL bValue)) PURE;
 	STDMETHOD_(BOOL, GetAtmosObjects()) PURE;
+	STDMETHOD(SetVideoSync(BOOL bValue)) PURE;
+	STDMETHOD_(BOOL, GetVideoSync()) PURE;
+	STDMETHOD(GetAtmosStatus(CString& output, CString& sync)) PURE;
 };

@@ -30,6 +30,7 @@
 #include "AudioTools/DitherInt16.h"
 #include "AudioSyncClock.h"
 #include "AtmosOutput.h"
+#include "VSyncMeter.h"
 #include "DSUtil/Packet.h"
 #include <ExtLib/libbs2b/bs2bclass.h>
 
@@ -84,6 +85,11 @@ class __declspec(uuid("32F9FD04-2C8B-4F3B-98F2-9EB7F0888A11"))
 	CAtmosOutput      m_Atmos;
 	bool              m_bAtmos = false;
 	BOOL              m_bAtmosObjects = TRUE; // option : TrueHD -> objets Atmos
+	BOOL              m_bVideoSync = TRUE;    // option : synchro facon ReClock
+	CVSyncMeter       m_VSync;
+	double            m_dVideoFps = 0.0;
+	double            DetectVideoFps();
+	void              UpdateSyncSpeed();
 	HANDLE            m_hAtmosAbort = nullptr;
 	bool    IsTrueHDBitstream(const WAVEFORMATEX* pwfx) const;
 	bool    AtmosSupported();
@@ -204,6 +210,9 @@ public:
 	STDMETHODIMP_(float)          GetLowLatencyMS() override;
 	STDMETHODIMP                  SetAtmosObjects(BOOL bValue) override;
 	STDMETHODIMP_(BOOL)           GetAtmosObjects() override;
+	STDMETHODIMP                  SetVideoSync(BOOL bValue) override;
+	STDMETHODIMP_(BOOL)           GetVideoSync() override;
+	STDMETHODIMP                  GetAtmosStatus(CString& output, CString& sync) override;
 
 	// CMpcAudioRenderer
 private:

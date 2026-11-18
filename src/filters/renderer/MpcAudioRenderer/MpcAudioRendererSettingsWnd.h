@@ -49,6 +49,7 @@ private :
 	CButton		m_cbDummyChannels;
 	CButton		m_cbPauseKeepActive;
 	CButton		m_cbAtmosObjects;
+	CButton		m_cbVideoSync;
 	CButton		m_btnReset;
 
 	CStatic		m_txtSoundDevice;
@@ -67,6 +68,7 @@ private :
 		IDC_PP_DUMMY_CHANNELS,
 		IDC_PP_PAUSE_KEEP_ACTIVE,
 		IDC_PP_ATMOS_OBJECTS,
+		IDC_PP_VIDEO_SYNC,
 		IDC_PP_RESET,
 	};
 
@@ -80,7 +82,7 @@ public:
 	bool OnApply();
 
 	static LPCWSTR GetWindowTitle() { return MAKEINTRESOURCEW(IDS_FILTER_SETTINGS_CAPTION); }
-	static CSize GetWindowSize() { return CSize(340, 251); }
+	static CSize GetWindowSize() { return CSize(340, 271); }
 
 	DECLARE_MESSAGE_MAP()
 
@@ -103,6 +105,8 @@ private :
 	CEdit		m_edtDevice;
 	CStatic		m_txtMode;
 	CEdit		m_edtMode;
+	CStatic		m_txtSync;
+	CEdit		m_edtSync;
 
 	CButton		m_grpInput;
 	CStatic		m_InputFormatLabel;
@@ -134,7 +138,7 @@ public:
 	void OnDeactivate();
 
 	static LPCWSTR GetWindowTitle() { return MAKEINTRESOURCEW(IDS_ARS_STATUS); }
-	static CSize GetWindowSize() { return CSize(392, 143); }
+	static CSize GetWindowSize() { return CSize(392, 163); }
 
 	DECLARE_MESSAGE_MAP()
 };

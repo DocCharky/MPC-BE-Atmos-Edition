@@ -49,6 +49,7 @@
 #define OPT_DummyChannels           L"DummyChannels"
 #define OPT_PauseKeepActive         L"PauseKeepActive"
 #define OPT_AtmosObjects            L"AtmosObjects"
+#define OPT_VideoSync               L"VideoSync"
 // TODO: rename option values
 
 // set to 1(or more) to enable more detail debug log
@@ -272,6 +273,9 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_AtmosObjects, dw)) {
 			m_bAtmosObjects = !!dw;
 		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_VideoSync, dw)) {
+			m_bVideoSync = !!dw;
+		}
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -288,6 +292,7 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_DummyChannels, m_bDummyChannels);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_PauseKeepActive, m_bPauseKeepActive);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_AtmosObjects, m_bAtmosObjects);
+	profile.ReadInt(OPT_SECTION_AudRend, OPT_VideoSync, m_bVideoSync);
 #endif
 
 	if (m_DeviceMode != MODE_WASAPI_EXCLUSIVE) {
@@ -359,6 +364,9 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 			m_pSyncClock->OffsetAudioClock(delta);
 		}
 	};
+	m_Atmos.OnTick = [this]() {
+		UpdateSyncSpeed();
+	};
 	if (phr) {
 		*phr = hr;
 	}
@@ -390,6 +398,7 @@ CMpcAudioRenderer::~CMpcAudioRenderer()
 		SetEvent(m_hAtmosAbort);
 	}
 	m_Atmos.Close();
+	m_VSync.Stop();
 	SAFE_CLOSE_HANDLE(m_hAtmosAbort);
 
 	m_pSyncClock->UnSlave();
@@ -601,6 +610,7 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 	if (m_bAtmos) {
 		m_Atmos.Close();
 		m_bAtmos = false;
+		m_pSyncClock->SetSpeed(1.0);
 	}
 
 	if (!m_pAudioClient) {
@@ -837,6 +847,10 @@ STDMETHODIMP CMpcAudioRenderer::Run(REFERENCE_TIME rtStart)
 
 	if (m_bAtmos) {
 		ResetEvent(m_hAtmosAbort);
+		m_dVideoFps = DetectVideoFps();
+		if (m_bVideoSync) {
+			m_VSync.Start();
+		}
 		m_Atmos.SetRunning(true);
 		if (m_Atmos.GetAudioClock() && !m_pSyncClock->IsSlave()) {
 			m_pSyncClock->Slave(m_Atmos.GetAudioClock(), m_rtStartTime + m_Atmos.GetCurrentRenderedTime());
@@ -1212,6 +1226,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 		key.SetDWORDValue(OPT_DummyChannels, m_bDummyChannels);
 		key.SetDWORDValue(OPT_PauseKeepActive, m_bPauseKeepActive);
 		key.SetDWORDValue(OPT_AtmosObjects, m_bAtmosObjects);
+		key.SetDWORDValue(OPT_VideoSync, m_bVideoSync);
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -1228,6 +1243,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_DummyChannels, m_bDummyChannels);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_PauseKeepActive, m_bPauseKeepActive);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_AtmosObjects, m_bAtmosObjects);
+	profile.WriteInt(OPT_SECTION_AudRend, OPT_VideoSync, m_bVideoSync);
 #endif
 
 	return S_OK;
@@ -1337,6 +1353,10 @@ STDMETHODIMP_(UINT) CMpcAudioRenderer::GetMode()
 	CAutoLock cAutoLock(&m_csProps);
 
 	CheckPointer(m_pGraph, MODE_WASAPI_NONE)
+
+	if (m_bAtmos) {
+		return MODE_WASAPI_SHARED;
+	}
 
 	if (m_bIsBitstream) {
 		return MODE_WASAPI_EXCLUSIVE_BITSTREAM;
@@ -3612,6 +3632,113 @@ STDMETHODIMP_(BOOL) CMpcAudioRenderer::GetAtmosObjects()
 {
 	CAutoLock cAutoLock(&m_csProps);
 	return m_bAtmosObjects;
+}
+
+STDMETHODIMP CMpcAudioRenderer::SetVideoSync(BOOL bValue)
+{
+	CAutoLock cAutoLock(&m_csProps);
+	m_bVideoSync = bValue;
+	if (!bValue) {
+		m_Atmos.SetSpeed(1.0);
+		m_pSyncClock->SetSpeed(1.0);
+	}
+	return S_OK;
+}
+
+STDMETHODIMP_(BOOL) CMpcAudioRenderer::GetVideoSync()
+{
+	CAutoLock cAutoLock(&m_csProps);
+	return m_bVideoSync;
+}
+
+STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
+{
+	output.Empty();
+	sync.Empty();
+	if (!m_bAtmos) {
+		return S_FALSE;
+	}
+	output.Format(L"Windows Spatial Sound, TrueHD \u2192 objets (%u objets dynamiques max)", m_Atmos.GetDynamicObjectCount());
+
+	double hz = 0.0, secs = 0.0;
+	const bool bMeasured = m_VSync.GetRefreshRate(hz, secs);
+	const double speed = m_Atmos.GetSpeed();
+	if (!m_bVideoSync) {
+		sync = L"Synchro \u00e9cran d\u00e9sactiv\u00e9e";
+	} else if (m_dVideoFps <= 0.0) {
+		sync = L"Synchro \u00e9cran : pas de vid\u00e9o d\u00e9tect\u00e9e";
+	} else if (!bMeasured) {
+		sync.Format(L"Film %.3f i/s, mesure de l'\u00e9cran en cours...", m_dVideoFps);
+	} else {
+		sync.Format(L"Film %.3f i/s, \u00e9cran %.5f Hz (mesur\u00e9 sur %.0f s), vitesse x%.6f", m_dVideoFps, hz, secs, speed);
+	}
+	return S_OK;
+}
+
+double CMpcAudioRenderer::DetectVideoFps()
+{
+	double fps = 0.0;
+	if (!m_pGraph) {
+		return fps;
+	}
+	BeginEnumFilters(m_pGraph, pEF, pBF) {
+		bool bHasOutput = false;
+		REFERENCE_TIME rtAvg = 0;
+		BeginEnumPins(pBF, pEP, pPin) {
+			PIN_DIRECTION dir;
+			if (FAILED(pPin->QueryDirection(&dir))) {
+				continue;
+			}
+			if (dir == PINDIR_OUTPUT) {
+				bHasOutput = true;
+				continue;
+			}
+			AM_MEDIA_TYPE mt = {};
+			if (SUCCEEDED(pPin->ConnectionMediaType(&mt))) {
+				if (mt.majortype == MEDIATYPE_Video && mt.pbFormat) {
+					if (mt.formattype == FORMAT_VideoInfo2 && mt.cbFormat >= sizeof(VIDEOINFOHEADER2)) {
+						rtAvg = ((VIDEOINFOHEADER2*)mt.pbFormat)->AvgTimePerFrame;
+					} else if (mt.formattype == FORMAT_VideoInfo && mt.cbFormat >= sizeof(VIDEOINFOHEADER)) {
+						rtAvg = ((VIDEOINFOHEADER*)mt.pbFormat)->AvgTimePerFrame;
+					}
+				}
+				FreeMediaType(mt);
+			}
+		}
+		EndEnumPins
+		if (!bHasOutput && rtAvg > 0) {
+			fps = 10000000.0 / (double)rtAvg;
+			break;
+		}
+	}
+	EndEnumFilters
+	DLog(L"CMpcAudioRenderer::DetectVideoFps() : %.3f fps", fps);
+	return fps;
+}
+
+void CMpcAudioRenderer::UpdateSyncSpeed()
+{
+	// Synchro facon ReClock : vitesse = rafraichissement reel / (k x cadence du film).
+	double target = 1.0;
+	double hz = 0.0, secs = 0.0;
+	if (m_bVideoSync && m_dVideoFps > 0.0 && m_VSync.GetRefreshRate(hz, secs) && secs >= 15.0) {
+		const double k = std::floor(hz / m_dVideoFps + 0.5);
+		if (k >= 1.0 && k <= 8.0) {
+			const double r = hz / (k * m_dVideoFps);
+			if (std::abs(r - 1.0) <= 0.002) {
+				target = r;
+			}
+		}
+	}
+	const double current = m_Atmos.GetSpeed();
+	double next = current + (target - current) * 0.25;
+	if (std::abs(next - target) < 1e-7) {
+		next = target;
+	}
+	if (next != current) {
+		m_Atmos.SetSpeed(next);
+		m_pSyncClock->SetSpeed(next);
+	}
 }
 
 bool CMpcAudioRenderer::AtmosSupported()

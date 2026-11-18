@@ -77,6 +77,26 @@ void CAudioSyncClock::UnSlave()
 	m_pAudioClock = nullptr;
 }
 
+void CAudioSyncClock::SetSpeed(double speed)
+{
+	CAutoLock lock(this);
+
+	if (speed == m_speed) {
+		return;
+	}
+	if (m_pAudioClock) {
+		// Rebase : le temps deja ecoule reste compte a l'ancienne vitesse.
+		UINT64 audioFrequency, audioPosition;
+		if (SUCCEEDED(m_pAudioClock->GetFrequency(&audioFrequency))
+				&& SUCCEEDED(m_pAudioClock->GetPosition(&audioPosition, nullptr))
+				&& audioPosition > m_audioStartPosition) {
+			m_audioStart += (REFERENCE_TIME)(llMulDiv(audioPosition - m_audioStartPosition, UNITS, audioFrequency, 0) * m_speed);
+			m_audioStartPosition = audioPosition;
+		}
+	}
+	m_speed = speed;
+}
+
 void CAudioSyncClock::OffsetAudioClock(const REFERENCE_TIME offsetTime)
 {
 	CAutoLock lock(this);
@@ -96,8 +116,8 @@ HRESULT CAudioSyncClock::GetAudioClockTime(REFERENCE_TIME* pAudioTime, REFERENCE
 				&& SUCCEEDED(m_pAudioClock->GetPosition(&audioPosition, &audioTime))
 				&& audioPosition > m_audioStartPosition) {
 			const LONGLONG counterTime = GetPerfCounter();
-			const LONGLONG clockTime   = llMulDiv(audioPosition - m_audioStartPosition, UNITS, audioFrequency, 0)
-										 + m_audioStart + m_audioOffset + counterTime - audioTime;
+			const LONGLONG clockTime   = (LONGLONG)(llMulDiv(audioPosition - m_audioStartPosition, UNITS, audioFrequency, 0) * m_speed)
+										 + m_audioStart + m_audioOffset + (LONGLONG)((counterTime - audioTime) * m_speed);
 
 			*pAudioTime = clockTime;
 

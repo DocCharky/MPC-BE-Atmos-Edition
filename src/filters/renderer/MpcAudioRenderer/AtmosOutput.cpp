@@ -11,6 +11,7 @@
 #include "AtmosOutput.h"
 #include <algorithm>
 #include <cstring>
+#include <cmath>
 
 // ---- thdatmos.dll ----
 namespace
@@ -72,6 +73,44 @@ namespace
 	inline REFERENCE_TIME SamplesToTime(uint64_t n) { return (REFERENCE_TIME)(n * UNITS_PER_SEC / SAMPLE_RATE); }
 
 	template <class T> void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
+	// Noyau d'interpolation sinc fenêtré (Kaiser), 48 coefficients, 2048 phases (~110 dB).
+	constexpr int KERNEL_HALF = 24;
+	constexpr int KERNEL_PHASES = 2048;
+
+	double BesselI0(double x)
+	{
+		double sum = 1.0, term = 1.0;
+		for (int k = 1; k < 50; k++) {
+			term *= (x / (2.0 * k)) * (x / (2.0 * k));
+			sum += term;
+			if (term < 1e-12 * sum) {
+				break;
+			}
+		}
+		return sum;
+	}
+
+	struct Kernel {
+		float taps[KERNEL_PHASES + 1][2 * KERNEL_HALF];
+		Kernel() {
+			const double beta = 10.0, cutoff = 1.0;
+			const double i0b = BesselI0(beta);
+			for (int ph = 0; ph <= KERNEL_PHASES; ph++) {
+				const double frac = (double)ph / KERNEL_PHASES;
+				for (int k = 0; k < 2 * KERNEL_HALF; k++) {
+					// distance entre l'échantillon k et la position fractionnaire
+					const double t = (double)(k - KERNEL_HALF + 1) - frac;
+					const double x = 3.14159265358979323846 * cutoff * t;
+					const double sinc = (std::fabs(t) < 1e-12) ? 1.0 : std::sin(x) / x;
+					const double r = t / KERNEL_HALF;
+					const double w = (std::fabs(r) >= 1.0) ? 0.0 : BesselI0(beta * std::sqrt(1.0 - r * r)) / i0b;
+					taps[ph][k] = (float)(cutoff * sinc * w);
+				}
+			}
+		}
+	};
+	const Kernel g_kernel;
 }
 
 CAtmosOutput::CAtmosOutput()
@@ -201,7 +240,7 @@ void CAtmosOutput::Close()
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_queue.clear();
 	m_nQueuedSamples = 0;
-	m_pCurrent.reset();
+	ResetBuffers();
 	m_bHaveState = false;
 }
 
@@ -277,15 +316,24 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 	return S_OK;
 }
 
+void CAtmosOutput::ResetBuffers()
+{
+	for (auto& v : m_in) {
+		v.clear();
+	}
+	m_base = m_end = 0;
+	m_pos = 0.0;
+	m_segments.clear();
+	m_rtNextQueued = 0;
+}
+
 void CAtmosOutput::Flush()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_queue.clear();
 	m_nQueuedSamples = 0;
-	m_pCurrent.reset();
-	m_nCurrentOffset = 0;
+	ResetBuffers();
 	m_rtNextDecoded = INVALID_TIME_VALUE;
-	m_rtNextRendered = 0;
 	m_rtCurrentRendered = 0;
 	if (m_pDecoder) {
 		g_thd.reset(m_pDecoder);
@@ -305,11 +353,36 @@ void CAtmosOutput::SetVolume(float volume)
 	m_fVolume = volume;
 }
 
+void CAtmosOutput::SetSpeed(double speed)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	m_dSpeed = speed;
+}
+
+double CAtmosOutput::GetSpeed()
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	return m_dSpeed;
+}
+
+const CAtmosOutput::Segment* CAtmosOutput::SegmentAt(uint64_t index) const
+{
+	const Segment* s = nullptr;
+	for (const auto& seg : m_segments) {
+		if (seg.start <= index) {
+			s = &seg;
+		} else {
+			break;
+		}
+	}
+	return s;
+}
+
 REFERENCE_TIME CAtmosOutput::GetCurrentRenderedTime()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
-	if (m_pCurrent) {
-		return m_rtCurrentStart + SamplesToTime(m_nCurrentOffset);
+	if (const Segment* s = SegmentAt((uint64_t)m_pos)) {
+		return s->rtStart + (REFERENCE_TIME)((m_pos - (double)s->start) * UNITS_PER_SEC / SAMPLE_RATE);
 	}
 	if (!m_queue.empty()) {
 		return m_queue.front().rtStart;
@@ -320,7 +393,8 @@ REFERENCE_TIME CAtmosOutput::GetCurrentRenderedTime()
 size_t CAtmosOutput::QueuedSamples()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
-	return m_nQueuedSamples + (m_pCurrent ? m_pCurrent->samples - m_nCurrentOffset : 0);
+	const double buffered = (double)m_end - m_pos;
+	return m_nQueuedSamples + (buffered > 0 ? (size_t)buffered : 0);
 }
 
 DWORD CAtmosOutput::RenderThread()
@@ -335,8 +409,62 @@ DWORD CAtmosOutput::RenderThread()
 		if (r == WAIT_OBJECT_0 + 1) {
 			RenderPeriod();
 		}
+		const DWORD now = GetTickCount();
+		if (now - m_dwLastTick >= 1000) {
+			m_dwLastTick = now;
+			if (OnTick) {
+				OnTick();
+			}
+		}
 	}
 	return 0;
+}
+
+bool CAtmosOutput::PullFrame()
+{
+	if (m_queue.empty()) {
+		return false;
+	}
+	QueuedFrame q = std::move(m_queue.front());
+	m_queue.pop_front();
+	m_nQueuedSamples -= q.f->samples;
+	SetEvent(m_hSpaceEvent);
+
+	// Saut d'horodatage : on recale l'horloge, comme le renderer d'origine.
+	if (!m_segments.empty()) {
+		const REFERENCE_TIME delta = q.rtStart - m_rtNextQueued;
+		if ((delta > 200 || delta < -200) && OnClockOffset) {
+			OnClockOffset(delta);
+		}
+	}
+	m_rtNextQueued = q.rtStart + SamplesToTime(q.f->samples);
+
+	Segment seg;
+	seg.start    = m_end;
+	seg.len      = q.f->samples;
+	seg.channels = std::min<uint32_t>(q.f->channels, 16);
+	seg.rtStart  = q.rtStart;
+	memcpy(seg.elements, q.f->elements, sizeof(seg.elements));
+	m_segments.push_back(seg);
+
+	for (unsigned c = 0; c < 16; c++) {
+		auto& v = m_in[c];
+		const size_t old = v.size();
+		v.resize(old + q.f->samples);
+		for (uint32_t k = 0; k < q.f->samples; k++) {
+			v[old + k] = (c < seg.channels) ? q.f->pcm[k][c] : 0.0f;
+		}
+	}
+	m_end += q.f->samples;
+	return true;
+}
+
+float CAtmosOutput::Sample(unsigned c, int64_t index) const
+{
+	if (index < (int64_t)m_base || index >= (int64_t)m_end) {
+		return 0.0f;
+	}
+	return m_in[c][(size_t)(index - (int64_t)m_base)];
 }
 
 void CAtmosOutput::RenderPeriod()
@@ -348,12 +476,21 @@ void CAtmosOutput::RenderPeriod()
 
 	std::unique_lock<std::mutex> lock(m_mutex);
 
-	// Découvre la nature des éléments (LFE ou objet) dès la première trame disponible.
-	const Frame* pFirst = m_pCurrent ? m_pCurrent.get() : (!m_queue.empty() ? m_queue.front().f.get() : nullptr);
-	unsigned nch = 0;
+	// Alimente le tampon d'entrée : il faut couvrir la période plus le noyau d'interpolation.
+	const double speed = m_bRunning ? m_dSpeed : 1.0;
+	if (m_bRunning) {
+		const double need = m_pos + frames * speed + KERNEL_HALF + 2;
+		while ((double)m_end < need && PullFrame()) {
+		}
+	}
+
+	// Découvre la nature des éléments (LFE ou objet) dès que des données sont là.
+	const Segment* pFirst = SegmentAt((uint64_t)m_pos);
+	if (!pFirst && !m_segments.empty()) {
+		pFirst = &m_segments.front();
+	}
 	if (pFirst) {
-		nch = std::min<uint32_t>(pFirst->channels, 16);
-		for (unsigned c = 0; c < nch; c++) {
+		for (unsigned c = 0; c < pFirst->channels; c++) {
 			const uint32_t kind = pFirst->elements[c].kind;
 			if (m_pObjects[c] && m_ObjectKind[c] != kind) {
 				m_pObjects[c]->SetEndOfStream(0);
@@ -381,52 +518,67 @@ void CAtmosOutput::RenderPeriod()
 		}
 	}
 
-	UINT32 i = 0;
-	bool stateSet = false;
-	if (m_bRunning) {
-		while (i < frames) {
-			if (!m_pCurrent) {
-				if (m_queue.empty()) {
-					break;
-				}
-				QueuedFrame q = std::move(m_queue.front());
-				m_queue.pop_front();
-				m_nQueuedSamples -= q.f->samples;
-				m_pCurrent = std::move(q.f);
-				m_rtCurrentStart = q.rtStart;
-				m_nCurrentOffset = 0;
+	if (m_bRunning && m_end > m_base) {
+		if (const Segment* s = SegmentAt((uint64_t)m_pos)) {
+			memcpy(m_State, s->elements, sizeof(m_State));
+			m_bHaveState = true;
+		}
 
-				// Saut d'horodatage : on recale l'horloge, comme le renderer d'origine.
-				const REFERENCE_TIME delta = m_rtCurrentStart - m_rtNextRendered;
-				if (m_rtNextRendered && (delta > 200 || delta < -200) && OnClockOffset) {
-					OnClockOffset(delta);
-				}
-				m_rtNextRendered = m_rtCurrentStart + SamplesToTime(m_pCurrent->samples);
-				SetEvent(m_hSpaceEvent);
+		// Échantillons produits tant que le noyau reste dans le tampon.
+		UINT32 i = 0;
+		for (; i < frames; i++) {
+			const double p = m_pos;
+			const int64_t ip = (int64_t)std::floor(p);
+			if (ip + KERNEL_HALF >= (int64_t)m_end) {
+				break; // famine : le reste de la période est silencieux
 			}
-			if (!stateSet) {
-				memcpy(m_State, m_pCurrent->elements, sizeof(m_State));
-				m_bHaveState = stateSet = true;
-			}
-			const UINT32 n = std::min<UINT32>(frames - i, m_pCurrent->samples - m_nCurrentOffset);
-			const unsigned ch = std::min<uint32_t>(m_pCurrent->channels, 16);
-			for (unsigned c = 0; c < ch; c++) {
-				if (out[c]) {
-					for (UINT32 k = 0; k < n; k++) {
-						out[c][i + k] = m_pCurrent->pcm[m_nCurrentOffset + k][c];
+			const double frac = p - (double)ip;
+			const unsigned phase = (unsigned)(frac * KERNEL_PHASES);
+			if (phase == 0 && frac * KERNEL_PHASES < 1e-9) {
+				// Position entière : copie exacte (aucune altération à vitesse 1).
+				for (unsigned c = 0; c < 16; c++) {
+					if (out[c]) {
+						out[c][i] = Sample(c, ip);
 					}
 				}
+			} else {
+				const float mu = (float)(frac * KERNEL_PHASES - phase);
+				const float* h0 = &g_kernel.taps[phase][0];
+				const float* h1 = &g_kernel.taps[phase + 1][0];
+				for (unsigned c = 0; c < 16; c++) {
+					if (!out[c]) {
+						continue;
+					}
+					float acc = 0.0f;
+					for (int k = 0; k < 2 * KERNEL_HALF; k++) {
+						const float h = h0[k] + mu * (h1[k] - h0[k]);
+						acc += h * Sample(c, ip - KERNEL_HALF + 1 + k);
+					}
+					out[c][i] = acc;
+				}
 			}
-			i += n;
-			m_nCurrentOffset += n;
-			m_rtCurrentRendered = m_rtCurrentStart + SamplesToTime(m_nCurrentOffset);
-			if (m_nCurrentOffset >= m_pCurrent->samples) {
-				m_pCurrent.reset();
+			m_pos += speed;
+		}
+
+		if (const Segment* s = SegmentAt((uint64_t)m_pos)) {
+			m_rtCurrentRendered = s->rtStart + (REFERENCE_TIME)((m_pos - (double)s->start) * UNITS_PER_SEC / SAMPLE_RATE);
+		}
+
+		// Libère l'entrée consommée (en gardant le contexte du noyau).
+		const int64_t keep = (int64_t)std::floor(m_pos) - KERNEL_HALF - 1;
+		if (keep > (int64_t)m_base + 4096) {
+			const size_t drop = (size_t)(keep - (int64_t)m_base);
+			for (auto& v : m_in) {
+				v.erase(v.begin(), v.begin() + drop);
+			}
+			m_base += drop;
+			while (m_segments.size() > 1 && m_segments[1].start <= m_base) {
+				m_segments.pop_front();
 			}
 		}
 	}
 
-	// Positions et gains de la trame qui couvre le début de la période.
+	// Positions et gains au début de la période.
 	for (unsigned c = 0; c < 16; c++) {
 		if (!m_pObjects[c]) {
 			continue;

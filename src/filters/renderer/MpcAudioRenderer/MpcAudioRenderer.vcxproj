@@ -91,6 +91,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AtmosOutput.cpp" />
+    <ClCompile Include="VSyncMeter.cpp" />
     <ClCompile Include="AudioDevice.cpp" />
     <ClCompile Include="AudioSyncClock.cpp" />
     <ClCompile Include="MpcAudioRenderer.cpp" />
@@ -104,6 +105,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AtmosOutput.h" />
+    <ClInclude Include="VSyncMeter.h" />
     <ClInclude Include="AudioDevice.h" />
     <ClInclude Include="AudioSyncClock.h" />
     <ClInclude Include="IMpcAudioRenderer.h" />
