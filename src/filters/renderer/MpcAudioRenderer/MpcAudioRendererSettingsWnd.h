@@ -50,6 +50,7 @@ private :
 	CButton		m_cbPauseKeepActive;
 	CButton		m_cbAtmosObjects;
 	CButton		m_cbVideoSync;
+	CButton		m_cbHeightObjects;
 	CButton		m_btnReset;
 
 	CStatic		m_txtSoundDevice;
@@ -69,6 +70,7 @@ private :
 		IDC_PP_PAUSE_KEEP_ACTIVE,
 		IDC_PP_ATMOS_OBJECTS,
 		IDC_PP_VIDEO_SYNC,
+		IDC_PP_HEIGHT_OBJECTS,
 		IDC_PP_RESET,
 	};
 
@@ -82,7 +84,7 @@ public:
 	bool OnApply();
 
 	static LPCWSTR GetWindowTitle() { return MAKEINTRESOURCEW(IDS_FILTER_SETTINGS_CAPTION); }
-	static CSize GetWindowSize() { return CSize(340, 287); }
+	static CSize GetWindowSize() { return CSize(340, 323); }
 
 	DECLARE_MESSAGE_MAP()
 

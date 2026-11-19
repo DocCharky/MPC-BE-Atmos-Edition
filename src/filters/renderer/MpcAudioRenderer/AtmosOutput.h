@@ -5,6 +5,8 @@
  * through Windows Spatial Sound ("Dolby Atmos for home theater"): each element
  * of the track becomes a positioned audio object. TrueHD decoding is done by
  * thdatmos.dll (based on truehdd, Apache 2.0 license).
+ * Also plays PCM with height channels (DTS:X decoded by MPC-BE, 7.1.4 files):
+ * each channel becomes an object fixed at its speaker position.
  *
  * ReClock-style sync: when enabled, playback is sped up or slowed down by a
  * factor close to 1 (resampling) so that the film follows the real display
@@ -52,6 +54,9 @@ public:
 	// hAbort1/hAbort2 are signaled (stop, flush).
 	HRESULT Receive(const BYTE* pData, long size, REFERENCE_TIME rtStart, bool bDiscontinuity,
 					HANDLE hAbort1, HANDLE hAbort2);
+	// Interleaved float PCM at 48 kHz; channel order and positions from the WAVE channel mask.
+	HRESULT ReceivePcm(const float* pPcm, uint32_t samples, uint32_t channels, uint32_t channelMask,
+					   REFERENCE_TIME rtStart, bool bDiscontinuity, HANDLE hAbort);
 
 	void Flush();                     // clears the queue and resets the decoder
 	void SetRunning(bool bRunning);   // false: render silence
@@ -95,6 +100,8 @@ private:
 		Element        elements[16];
 	};
 
+	bool  WaitForSpace(HANDLE hAbort1, HANDLE hAbort2); // false if aborted
+	void  QueueFrame(std::unique_ptr<Frame>& frame, REFERENCE_TIME rtStart, bool& bDiscontinuity);
 	static DWORD WINAPI ThreadProc(LPVOID p) { return static_cast<CAtmosOutput*>(p)->RenderThread(); }
 	DWORD RenderThread();
 	void  RenderPeriod();

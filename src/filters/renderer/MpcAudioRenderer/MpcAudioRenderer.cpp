@@ -50,6 +50,7 @@
 #define OPT_PauseKeepActive         L"PauseKeepActive"
 #define OPT_AtmosObjects            L"AtmosObjects"
 #define OPT_VideoSync               L"VideoSync"
+#define OPT_HeightObjects           L"HeightObjects"
 // TODO: rename option values
 
 // set to 1(or more) to enable more detail debug log
@@ -276,6 +277,9 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_VideoSync, dw)) {
 			m_bVideoSync = !!dw;
 		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HeightObjects, dw)) {
+			m_bHeightObjects = !!dw;
+		}
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -293,6 +297,7 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_PauseKeepActive, m_bPauseKeepActive);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_AtmosObjects, m_bAtmosObjects);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_VideoSync, m_bVideoSync);
+	profile.ReadInt(OPT_SECTION_AudRend, OPT_HeightObjects, m_bHeightObjects);
 #endif
 
 	if (m_DeviceMode != MODE_WASAPI_EXCLUSIVE) {
@@ -586,7 +591,9 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 
 	AtmosLog(L"SetMediaType: format 0x%04x, %u channels, %u Hz%s", pwf->wFormatTag, pwf->nChannels, pwf->nSamplesPerSec,
 			 IsTrueHDBitstream(pwf) ? L" (TrueHD IEC 61937)" : L"");
-	if (IsTrueHDBitstream(pwf) && AtmosSupported()) {
+	const bool bTrueHD = IsTrueHDBitstream(pwf) && AtmosSupported();
+	const bool bHeights = !bTrueHD && IsHeightPcm(pwf);
+	if (bTrueHD || (bHeights && SpatialAvailable())) {
 		// Atmos Edition: release the WASAPI output (the spatial stream goes through the shared engine)
 		m_pSyncClock->UnSlave();
 		PauseRendererThread();
@@ -604,20 +611,36 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 
 		hr = m_Atmos.Open(m_pMMDevice);
 		if (SUCCEEDED(hr)) {
-			AtmosLog(L"SetMediaType: TrueHD -> Atmos objects (%u dynamic objects)", m_Atmos.GetDynamicObjectCount());
+			if (bTrueHD) {
+				AtmosLog(L"SetMediaType: TrueHD -> Atmos objects (%u dynamic objects)", m_Atmos.GetDynamicObjectCount());
+			} else {
+				AtmosLog(L"SetMediaType: PCM with height channels (%u channels, mask 0x%x) -> objects", pwf->nChannels,
+						 ((const WAVEFORMATEXTENSIBLE*)pwf)->dwChannelMask);
+			}
 			m_bAtmos = true;
+			m_bSpatialPcm = bHeights;
 			m_Atmos.SetVolume((float)m_dVolumeFactor);
 			CopyWaveFormat(pwf, &m_pWaveFormatExInput);
-			m_BitstreamMode = BITSTREAM_TRUEHD;
+			m_BitstreamMode = bTrueHD ? BITSTREAM_TRUEHD : BITSTREAM_NONE;
+			if (m_filterState == State_Running) {
+				// Format change during playback (e.g. DTS:X heights appearing): Run() will not be called again.
+				AtmosLog(L"SetMediaType: switching to spatial output during playback");
+				ResetEvent(m_hAtmosAbort);
+				m_Atmos.SetRunning(true);
+				if (m_Atmos.GetAudioClock()) {
+					m_pSyncClock->Slave(m_Atmos.GetAudioClock(), m_rtStartTime + m_rtLastReceivedSampleTimeEnd);
+				}
+			}
 			return CBaseRenderer::SetMediaType(pmt);
 		}
-		AtmosLog(L"SetMediaType: Atmos output failed (0x%08x), falling back to bitstream", hr);
+		AtmosLog(L"SetMediaType: spatial output failed (0x%08x), falling back to WASAPI", hr);
 		hr = S_OK;
 	}
 	if (m_bAtmos) {
 		m_Atmos.Close();
 		m_bAtmos = false;
-		m_pSyncClock->SetSpeed(1.0);
+		m_bSpatialPcm = false;
+		SetSyncSpeed(1.0);
 	}
 
 	if (!m_pAudioClient) {
@@ -1245,6 +1268,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 		key.SetDWORDValue(OPT_PauseKeepActive, m_bPauseKeepActive);
 		key.SetDWORDValue(OPT_AtmosObjects, m_bAtmosObjects);
 		key.SetDWORDValue(OPT_VideoSync, m_bVideoSync);
+		key.SetDWORDValue(OPT_HeightObjects, m_bHeightObjects);
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -1262,6 +1286,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_PauseKeepActive, m_bPauseKeepActive);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_AtmosObjects, m_bAtmosObjects);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_VideoSync, m_bVideoSync);
+	profile.WriteInt(OPT_SECTION_AudRend, OPT_HeightObjects, m_bHeightObjects);
 #endif
 
 	return S_OK;
@@ -1585,7 +1610,7 @@ HRESULT CMpcAudioRenderer::Transform(IMediaSample *pMediaSample)
 #endif
 
 	if (m_bAtmos) {
-		return TransformAtmos(pMediaSample);
+		return m_bSpatialPcm ? TransformSpatialPcm(pMediaSample) : TransformAtmos(pMediaSample);
 	}
 
 	if (m_filterState == State_Stopped
@@ -3716,8 +3741,11 @@ STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
 {
 	output.Empty();
 	sync.Empty();
-	if (m_bAtmos) {
-		output.Format(L"Windows Spatial Sound, TrueHD → objects (%u dynamic max)", m_Atmos.GetDynamicObjectCount());
+	if (m_bAtmos && m_bSpatialPcm) {
+		output.Format(L"Windows Spatial Sound, PCM with heights \u2192 fixed objects (%u channels)",
+					  m_pWaveFormatExInput ? m_pWaveFormatExInput->nChannels : 0);
+	} else if (m_bAtmos) {
+		output.Format(L"Windows Spatial Sound, TrueHD \u2192 objects (%u dynamic max)", m_Atmos.GetDynamicObjectCount());
 	}
 
 	double hz = 0.0, secs = 0.0, audioRate = 0.0, audioSecs = 0.0;
@@ -3857,26 +3885,116 @@ bool CMpcAudioRenderer::AtmosSupported()
 		AtmosLog(L"AtmosSupported: thdatmos.dll not loaded");
 		return false;
 	}
+	return SpatialAvailable();
+}
+
+// Is a spatial sound format ("Dolby Atmos for home theater") active on the output device?
+bool CMpcAudioRenderer::SpatialAvailable()
+{
 	if (!m_pMMDevice && FAILED(GetAudioDevice(FALSE))) {
-		AtmosLog(L"AtmosSupported: no audio device");
+		AtmosLog(L"SpatialAvailable: no audio device");
 		return false;
 	}
 	if (!m_pMMDevice) {
-		AtmosLog(L"AtmosSupported: no audio device");
+		AtmosLog(L"SpatialAvailable: no audio device");
 		return false;
 	}
 	CComPtr<ISpatialAudioClient> pSpatial;
 	HRESULT hr = m_pMMDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&pSpatial);
 	if (FAILED(hr)) {
-		AtmosLog(L"AtmosSupported: ISpatialAudioClient unavailable (0x%08x)", hr);
+		AtmosLog(L"SpatialAvailable: ISpatialAudioClient unavailable (0x%08x)", hr);
 		return false;
 	}
 	hr = pSpatial->IsSpatialAudioStreamAvailable(__uuidof(ISpatialAudioObjectRenderStream), nullptr);
 	if (FAILED(hr)) {
-		AtmosLog(L"AtmosSupported: no spatial sound active on '%s' (0x%08x)", m_strCurrentDeviceName.GetString(), hr);
+		AtmosLog(L"SpatialAvailable: no spatial sound active on '%s' (0x%08x)", m_strCurrentDeviceName.GetString(), hr);
 		return false;
 	}
 	return true;
+}
+
+// PCM with height channels (DTS:X decoded by MPC-BE, 7.1.4 files): played as fixed objects,
+// since HDMI PCM stops at 8 channels and Windows would fold the heights into the bed.
+bool CMpcAudioRenderer::IsHeightPcm(const WAVEFORMATEX* pwf) const
+{
+	constexpr DWORD TOP_MASK = SPEAKER_TOP_CENTER | SPEAKER_TOP_FRONT_LEFT | SPEAKER_TOP_FRONT_CENTER | SPEAKER_TOP_FRONT_RIGHT
+							 | SPEAKER_TOP_BACK_LEFT | SPEAKER_TOP_BACK_CENTER | SPEAKER_TOP_BACK_RIGHT;
+	if (!m_bHeightObjects || !pwf || !IsWaveFormatExtensible(pwf) || IsBitstream(pwf)) {
+		return false;
+	}
+	const WAVEFORMATEXTENSIBLE* wfex = (const WAVEFORMATEXTENSIBLE*)pwf;
+	if (wfex->SubFormat != KSDATAFORMAT_SUBTYPE_PCM && wfex->SubFormat != KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
+		return false;
+	}
+	if (!(wfex->dwChannelMask & TOP_MASK)) {
+		return false;
+	}
+	if (pwf->nSamplesPerSec != 48000 || pwf->nChannels > 16) {
+		AtmosLog(L"IsHeightPcm: %u channels at %u Hz not supported (48 kHz, 16 channels max), heights folded", pwf->nChannels, pwf->nSamplesPerSec);
+		return false;
+	}
+	return true;
+}
+
+HRESULT CMpcAudioRenderer::TransformSpatialPcm(IMediaSample* pMediaSample)
+{
+	if (m_filterState == State_Stopped || !m_pWaveFormatExInput) {
+		return S_FALSE;
+	}
+
+	const long lSize = pMediaSample->GetActualDataLength();
+	const WAVEFORMATEX* pwf = m_pWaveFormatExInput;
+	const unsigned channels = pwf->nChannels;
+	const unsigned samples = pwf->nBlockAlign ? lSize / pwf->nBlockAlign : 0;
+	if (!samples) {
+		return S_FALSE;
+	}
+
+	REFERENCE_TIME rtStart, rtStop;
+	if (FAILED(pMediaSample->GetTime(&rtStart, &rtStop))) {
+		rtStart = rtStop = INVALID_TIME;
+	}
+	if (rtStart < 0 && rtStart != INVALID_TIME) {
+		return S_FALSE;
+	}
+
+	BYTE* pData = nullptr;
+	HRESULT hr = pMediaSample->GetPointer(&pData);
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	const SampleFormat sf = GetSampleFormat(pwf);
+	if (sf == SAMPLE_FMT_NONE) {
+		return S_FALSE;
+	}
+	m_SyncIn.resize((size_t)samples * channels);
+	hr = convert_to_float(sf, channels, samples, pData, m_SyncIn.data());
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	const DWORD mask = ((const WAVEFORMATEXTENSIBLE*)pwf)->dwChannelMask;
+	const bool bDiscontinuity = (S_OK == pMediaSample->IsDiscontinuity());
+	hr = m_Atmos.ReceivePcm(m_SyncIn.data(), samples, channels, mask,
+							rtStart == INVALID_TIME ? m_rtLastReceivedSampleTimeEnd : rtStart,
+							bDiscontinuity, m_hAtmosAbort);
+	m_rtLastReceivedSampleTimeEnd = (rtStart == INVALID_TIME ? m_rtLastReceivedSampleTimeEnd : rtStart)
+								  + llMulDiv(samples, UNITS, pwf->nSamplesPerSec, 0);
+	return hr;
+}
+
+STDMETHODIMP CMpcAudioRenderer::SetHeightObjects(BOOL bValue)
+{
+	CAutoLock cAutoLock(&m_csProps);
+	m_bHeightObjects = bValue;
+	return S_OK;
+}
+
+STDMETHODIMP_(BOOL) CMpcAudioRenderer::GetHeightObjects()
+{
+	CAutoLock cAutoLock(&m_csProps);
+	return m_bHeightObjects;
 }
 
 HRESULT CMpcAudioRenderer::TransformAtmos(IMediaSample* pMediaSample)

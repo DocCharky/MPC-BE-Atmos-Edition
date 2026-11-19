@@ -101,6 +101,8 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 	p.y += h20;
 	m_cbAtmosObjects.Create(L"TrueHD: decode and output as Atmos objects\n(Windows Spatial Sound)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT | BS_MULTILINE, CRect(p, CSize(ScaleX(320), m_fontheight * 2 + 2)), this, IDC_PP_ATMOS_OBJECTS);
 	p.y += h20 + m_fontheight;
+	m_cbHeightObjects.Create(L"DTS:X / PCM with height channels: output as objects\n(Windows Spatial Sound)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT | BS_MULTILINE, CRect(p, CSize(ScaleX(320), m_fontheight * 2 + 2)), this, IDC_PP_HEIGHT_OBJECTS);
+	p.y += h20 + m_fontheight;
 	m_cbVideoSync.Create(L"Sync audio to display refresh (ReClock-style, resamples)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_VIDEO_SYNC);
 	p.y += h20;
 	p.x += ScaleX(240);
@@ -148,6 +150,7 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 		m_cbPauseKeepActive.SetCheck(m_pMAR->GetPauseKeepActive());
 		m_cbAtmosObjects.SetCheck(m_pMAR->GetAtmosObjects());
 		m_cbVideoSync.SetCheck(m_pMAR->GetVideoSync());
+		m_cbHeightObjects.SetCheck(m_pMAR->GetHeightObjects());
 	}
 
 	for (CWnd* pWnd = GetWindow(GW_CHILD); pWnd; pWnd = pWnd->GetNextWindow()) {
@@ -190,6 +193,7 @@ bool CMpcAudioRendererSettingsWnd::OnApply()
 		m_pMAR->SetPauseKeepActive(m_cbPauseKeepActive.GetCheck());
 		m_pMAR->SetAtmosObjects(m_cbAtmosObjects.GetCheck());
 		m_pMAR->SetVideoSync(m_cbVideoSync.GetCheck());
+		m_pMAR->SetHeightObjects(m_cbHeightObjects.GetCheck());
 		int idx = m_cbSoundDevice.GetCurSel();
 		if (idx >= 0) {
 			m_pMAR->SetDeviceId(m_deviceList[idx].deviceId, m_deviceList[idx].deviceName);
@@ -248,6 +252,7 @@ void CMpcAudioRendererSettingsWnd::OnBnClickedReset()
 	m_cbPauseKeepActive.SetCheck(BST_UNCHECKED);
 	m_cbAtmosObjects.SetCheck(BST_CHECKED);
 	m_cbVideoSync.SetCheck(BST_CHECKED);
+	m_cbHeightObjects.SetCheck(BST_CHECKED);
 
 	OnClickedWasapiMode();
 
@@ -355,7 +360,8 @@ void CMpcAudioRendererStatusWnd::UpdateStatus()
 		m_edtMode.SetWindowTextW(modeStr);
 		m_edtSync.SetWindowTextW(atmosSync);
 
-		if (!atmosOut.IsEmpty()) {
+		const bool bSpatialPcm = !atmosOut.IsEmpty() && atmosOut.Find(L"TrueHD") < 0;
+		if (!atmosOut.IsEmpty() && !bSpatialPcm) {
 			m_InputFormatText.SetWindowTextW(L"TrueHD (bitstream)");
 			m_InputRateText.SetWindowTextW(L"48000");
 			m_InputChannelText.SetWindowTextW(L"Atmos / 16 max");
@@ -372,7 +378,7 @@ void CMpcAudioRendererStatusWnd::UpdateStatus()
 		else {
 			WAVEFORMATEX *pWfxIn, *pWfxOut;
 			m_pMAR->GetStatus(&pWfxIn, &pWfxOut);
-			if (pWfxIn && pWfxOut) {
+			if (pWfxIn && (pWfxOut || bSpatialPcm)) {
 				auto SetText = [](WAVEFORMATEX* pwfex, CStatic& formatText, CStatic& channelText, CStatic& rateText) {
 					bool bIsFloat = false;
 					bool m_b24PaddedTo32bit = false;
@@ -416,7 +422,13 @@ void CMpcAudioRendererStatusWnd::UpdateStatus()
 				};
 
 				SetText(pWfxIn, m_InputFormatText, m_InputChannelText, m_InputRateText);
-				SetText(pWfxOut, m_OutputFormatText, m_OutputChannelText, m_OutputRateText);
+				if (bSpatialPcm) {
+					m_OutputFormatText.SetWindowTextW(L"32-bit Float");
+					m_OutputRateText.SetWindowTextW(L"48000");
+					m_OutputChannelText.SetWindowTextW(L"Spatial objects");
+				} else {
+					SetText(pWfxOut, m_OutputFormatText, m_OutputChannelText, m_OutputRateText);
+				}
 			}
 		}
 	}

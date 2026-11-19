@@ -136,8 +136,8 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	if (IsOpen()) {
 		return S_OK;
 	}
-	if (!pDevice || !LibraryAvailable()) {
-		AtmosLog(L"Open: no device or no thdatmos.dll");
+	if (!pDevice) {
+		AtmosLog(L"Open: no device");
 		return E_FAIL;
 	}
 
@@ -210,7 +210,7 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 		return hr;
 	}
 
-	m_pDecoder = g_thd.create();
+	m_pDecoder = LibraryAvailable() ? g_thd.create() : nullptr; // TrueHD only; PCM needs no decoder
 
 	ResetEvent(m_hStopEvent);
 	hr = m_pStream->Start();
@@ -264,20 +264,8 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 		return E_FAIL;
 	}
 
-	// Back-pressure: stay at most about one second ahead of playback.
-	for (;;) {
-		{
-			std::lock_guard<std::mutex> lock(m_mutex);
-			if (m_nQueuedSamples < MAX_QUEUE_SAMPLES) {
-				break;
-			}
-		}
-		HANDLE h[3] = { m_hSpaceEvent, hAbort1, hAbort2 };
-		const DWORD n = hAbort2 ? 3 : (hAbort1 ? 2 : 1);
-		const DWORD r = WaitForMultipleObjects(n, h, FALSE, 100);
-		if (r == WAIT_OBJECT_0 + 1 || r == WAIT_OBJECT_0 + 2) {
-			return S_FALSE;
-		}
+	if (!WaitForSpace(hAbort1, hAbort2)) {
+		return S_FALSE;
 	}
 
 	if (!g_thd.push(m_pDecoder, pData, (size_t)size)) {
@@ -316,21 +304,114 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 				continue;
 			}
 		}
-		if (m_rtNextDecoded == INVALID_TIME_VALUE || bDiscontinuity) {
-			// Timestamp anchor: start of the current burst.
-			m_rtNextDecoded = rtStart;
-			m_nDecodedSinceAnchor = 0;
-			bDiscontinuity = false;
-		}
-		const REFERENCE_TIME t = m_rtNextDecoded + SamplesToTime(m_nDecodedSinceAnchor);
-		m_nDecodedSinceAnchor += frame->samples;
-
-		std::lock_guard<std::mutex> lock(m_mutex);
-		m_nQueuedSamples += frame->samples;
-		m_queue.push_back({ t, std::move(frame) });
-		frame = std::make_unique<Frame>();
+		QueueFrame(frame, rtStart, bDiscontinuity);
 	}
 
+	return S_OK;
+}
+
+bool CAtmosOutput::WaitForSpace(HANDLE hAbort1, HANDLE hAbort2)
+{
+	// Back-pressure: stay at most about one second ahead of playback.
+	for (;;) {
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			if (m_nQueuedSamples < MAX_QUEUE_SAMPLES) {
+				return true;
+			}
+		}
+		HANDLE h[3] = { m_hSpaceEvent, hAbort1, hAbort2 };
+		const DWORD n = hAbort2 ? 3 : (hAbort1 ? 2 : 1);
+		const DWORD r = WaitForMultipleObjects(n, h, FALSE, 100);
+		if (r == WAIT_OBJECT_0 + 1 || r == WAIT_OBJECT_0 + 2) {
+			return false;
+		}
+	}
+}
+
+void CAtmosOutput::QueueFrame(std::unique_ptr<Frame>& frame, REFERENCE_TIME rtStart, bool& bDiscontinuity)
+{
+	if (m_rtNextDecoded == INVALID_TIME_VALUE || bDiscontinuity) {
+		// Timestamp anchor: start of the current input packet.
+		m_rtNextDecoded = rtStart;
+		m_nDecodedSinceAnchor = 0;
+		bDiscontinuity = false;
+	}
+	const REFERENCE_TIME t = m_rtNextDecoded + SamplesToTime(m_nDecodedSinceAnchor);
+	m_nDecodedSinceAnchor += frame->samples;
+
+	std::lock_guard<std::mutex> lock(m_mutex);
+	m_nQueuedSamples += frame->samples;
+	m_queue.push_back({ t, std::move(frame) });
+	frame = std::make_unique<Frame>();
+}
+
+// Fixed position of a WAVE speaker (DAMF: x left/right, y back/front, z floor/ceiling).
+static CAtmosOutput::Element SpeakerElement(DWORD speaker, bool bSurroundAtSide)
+{
+	float x = 0, y = 0, z = 0;
+	switch (speaker) {
+		case SPEAKER_LOW_FREQUENCY:      return { KIND_LFE, 1, 0, 0, 0, 1.0f };
+		case SPEAKER_FRONT_LEFT:         x = -1.0f; y =  1.0f; break;
+		case SPEAKER_FRONT_RIGHT:        x =  1.0f; y =  1.0f; break;
+		case SPEAKER_FRONT_CENTER:       x =  0.0f; y =  1.0f; break;
+		case SPEAKER_BACK_LEFT:          x = -1.0f; y = bSurroundAtSide ? 0.0f : -1.0f; break;
+		case SPEAKER_BACK_RIGHT:         x =  1.0f; y = bSurroundAtSide ? 0.0f : -1.0f; break;
+		case SPEAKER_FRONT_LEFT_OF_CENTER:  x = -0.5f; y = 1.0f; break;
+		case SPEAKER_FRONT_RIGHT_OF_CENTER: x =  0.5f; y = 1.0f; break;
+		case SPEAKER_BACK_CENTER:        x =  0.0f; y = -1.0f; break;
+		case SPEAKER_SIDE_LEFT:          x = -1.0f; y =  0.0f; break;
+		case SPEAKER_SIDE_RIGHT:         x =  1.0f; y =  0.0f; break;
+		case SPEAKER_TOP_CENTER:         x =  0.0f; y =  0.0f; z = 1.0f; break;
+		case SPEAKER_TOP_FRONT_LEFT:     x = -1.0f; y =  1.0f; z = 1.0f; break;
+		case SPEAKER_TOP_FRONT_CENTER:   x =  0.0f; y =  1.0f; z = 1.0f; break;
+		case SPEAKER_TOP_FRONT_RIGHT:    x =  1.0f; y =  1.0f; z = 1.0f; break;
+		case SPEAKER_TOP_BACK_LEFT:      x = -1.0f; y = -1.0f; z = 1.0f; break;
+		case SPEAKER_TOP_BACK_CENTER:    x =  0.0f; y = -1.0f; z = 1.0f; break;
+		case SPEAKER_TOP_BACK_RIGHT:     x =  1.0f; y = -1.0f; z = 1.0f; break;
+		default: return { 0, 0, 0, 0, 0, 0.0f }; // unknown: muted
+	}
+	return { 0, 1, x, y, z, 1.0f };
+}
+
+HRESULT CAtmosOutput::ReceivePcm(const float* pPcm, uint32_t samples, uint32_t channels, uint32_t channelMask,
+								 REFERENCE_TIME rtStart, bool bDiscontinuity, HANDLE hAbort)
+{
+	if (!IsOpen() || !channels || channels > 16) {
+		return E_FAIL;
+	}
+	if (!WaitForSpace(hAbort, nullptr)) {
+		return S_FALSE;
+	}
+
+	// Channels follow the mask bits in ascending order.
+	Element elements[16] = {};
+	const bool bSurroundAtSide = (channelMask & (SPEAKER_BACK_LEFT | SPEAKER_SIDE_LEFT)) == SPEAKER_BACK_LEFT; // 5.1 "back"
+	unsigned c = 0;
+	for (DWORD bit = 1; bit && c < channels; bit <<= 1) {
+		if (channelMask & bit) {
+			elements[c++] = SpeakerElement(bit, bSurroundAtSide);
+		}
+	}
+
+	uint32_t done = 0;
+	while (done < samples) {
+		auto frame = std::make_unique<Frame>();
+		const uint32_t n = std::min<uint32_t>(samples - done, 160);
+		frame->sample_pos  = 0;
+		frame->samples     = n;
+		frame->channels    = channels;
+		frame->sample_rate = SAMPLE_RATE;
+		memcpy(frame->elements, elements, sizeof(elements));
+		for (uint32_t s = 0; s < n; s++) {
+			for (uint32_t ch = 0; ch < channels; ch++) {
+				frame->pcm[s][ch] = pPcm[(size_t)(done + s) * channels + ch];
+			}
+		}
+		const REFERENCE_TIME t = rtStart + SamplesToTime(done);
+		QueueFrame(frame, t, bDiscontinuity);
+		done += n;
+	}
 	return S_OK;
 }
 
