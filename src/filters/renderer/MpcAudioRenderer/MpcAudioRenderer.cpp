@@ -359,7 +359,7 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	m_pSyncClock = DNew CAudioSyncClock(GetOwner(), &hr);
 
 	m_hAtmosAbort = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-	AtmosLog(L"MPC Audio Renderer Atmos charge");
+	AtmosLog(L"MPC Audio Renderer Atmos loaded");
 	m_Atmos.OnClockOffset = [this](REFERENCE_TIME delta) {
 		if (m_pSyncClock) {
 			m_pSyncClock->OffsetAudioClock(delta);
@@ -452,7 +452,7 @@ HRESULT	CMpcAudioRenderer::CheckMediaType(const CMediaType *pmt)
 	}
 
 	if (pmt->subtype != MEDIASUBTYPE_PCM && pmt->subtype != MEDIASUBTYPE_IEEE_FLOAT) {
-		AtmosLog(L"CheckMediaType : sous-type non PCM refuse");
+		AtmosLog(L"CheckMediaType: non-PCM subtype refused");
 		DLog(L"CMpcAudioRenderer::CheckMediaType() - allow only PCM/IEEE_FLOAT input");
 		return VFW_E_TYPE_NOT_ACCEPTED;
 	}
@@ -464,10 +464,10 @@ HRESULT	CMpcAudioRenderer::CheckMediaType(const CMediaType *pmt)
 		const BOOL bIsBitstreamInput = IsBitstream(pWaveFormatEx);
 		if (bIsBitstreamInput && IsTrueHDBitstream(pWaveFormatEx)) {
 			if (AtmosSupported()) {
-				AtmosLog(L"CheckMediaType : TrueHD accepte pour la sortie Atmos");
+				AtmosLog(L"CheckMediaType: TrueHD accepted for Atmos output");
 				return S_OK;
 			}
-			AtmosLog(L"CheckMediaType : TrueHD propose, sortie Atmos indisponible -> verification bitstream");
+			AtmosLog(L"CheckMediaType: TrueHD offered, Atmos output unavailable -> bitstream check");
 		}
 		if (bIsBitstreamInput) {
 			hr = CreateAudioClient();
@@ -584,10 +584,10 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 
 	HRESULT hr = S_OK;
 
-	AtmosLog(L"SetMediaType : format 0x%04x, %u canaux, %u Hz%s", pwf->wFormatTag, pwf->nChannels, pwf->nSamplesPerSec,
+	AtmosLog(L"SetMediaType: format 0x%04x, %u channels, %u Hz%s", pwf->wFormatTag, pwf->nChannels, pwf->nSamplesPerSec,
 			 IsTrueHDBitstream(pwf) ? L" (TrueHD IEC 61937)" : L"");
 	if (IsTrueHDBitstream(pwf) && AtmosSupported()) {
-		// Atmos Edition : on libere la sortie WASAPI (le flux spatial passe par le moteur partage)
+		// Atmos Edition: release the WASAPI output (the spatial stream goes through the shared engine)
 		m_pSyncClock->UnSlave();
 		PauseRendererThread();
 		{
@@ -604,14 +604,14 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 
 		hr = m_Atmos.Open(m_pMMDevice);
 		if (SUCCEEDED(hr)) {
-			AtmosLog(L"SetMediaType : TrueHD -> objets Atmos (%u objets dynamiques)", m_Atmos.GetDynamicObjectCount());
+			AtmosLog(L"SetMediaType: TrueHD -> Atmos objects (%u dynamic objects)", m_Atmos.GetDynamicObjectCount());
 			m_bAtmos = true;
 			m_Atmos.SetVolume((float)m_dVolumeFactor);
 			CopyWaveFormat(pwf, &m_pWaveFormatExInput);
 			m_BitstreamMode = BITSTREAM_TRUEHD;
 			return CBaseRenderer::SetMediaType(pmt);
 		}
-		AtmosLog(L"SetMediaType : echec de la sortie Atmos (0x%08x), repli sur le bitstream", hr);
+		AtmosLog(L"SetMediaType: Atmos output failed (0x%08x), falling back to bitstream", hr);
 		hr = S_OK;
 	}
 	if (m_bAtmos) {
@@ -636,7 +636,7 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 
 	hr = CheckAudioClient(pwf);
 	if (FAILED(hr)) {
-		AtmosLog(L"SetMediaType : CheckAudioClient a echoue (0x%08x), connexion refusee", hr);
+		AtmosLog(L"SetMediaType: CheckAudioClient failed (0x%08x), connection refused", hr);
 	}
 
 	EXIT_ON_ERROR(hr);
@@ -858,7 +858,7 @@ STDMETHODIMP CMpcAudioRenderer::Run(REFERENCE_TIME rtStart)
 	if (m_bAtmos) {
 		ResetEvent(m_hAtmosAbort);
 		m_dVideoFps = DetectVideoFps();
-		AtmosLog(L"Run : lecture Atmos, film %.3f i/s, synchro ecran %s", m_dVideoFps, m_bVideoSync ? L"active" : L"inactive");
+		AtmosLog(L"Run: Atmos playback, film %.3f fps, display sync %s", m_dVideoFps, m_bVideoSync ? L"on" : L"off");
 		if (m_bVideoSync) {
 			m_VSync.Start();
 		}
@@ -3669,19 +3669,20 @@ STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
 	if (!m_bAtmos) {
 		return S_FALSE;
 	}
-	output.Format(L"Windows Spatial Sound, TrueHD \u2192 objets (%u objets dynamiques max)", m_Atmos.GetDynamicObjectCount());
+	output.Format(L"Windows Spatial Sound, TrueHD \u2192 objects (%u dynamic max)", m_Atmos.GetDynamicObjectCount());
 
-	double hz = 0.0, secs = 0.0;
+	double hz = 0.0, secs = 0.0, audioRate = 0.0, audioSecs = 0.0;
 	const bool bMeasured = m_VSync.GetRefreshRate(hz, secs);
+	const bool bAudio = m_Atmos.GetAudioClockRate(audioRate, audioSecs);
 	const double speed = m_Atmos.GetSpeed();
 	if (!m_bVideoSync) {
-		sync = L"Synchro \u00e9cran d\u00e9sactiv\u00e9e";
+		sync = L"Display sync off";
 	} else if (m_dVideoFps <= 0.0) {
-		sync = L"Synchro \u00e9cran : pas de vid\u00e9o d\u00e9tect\u00e9e";
-	} else if (!bMeasured) {
-		sync.Format(L"Film %.3f i/s, mesure de l'\u00e9cran en cours...", m_dVideoFps);
+		sync = L"Display sync: no video detected";
+	} else if (!bMeasured || !bAudio) {
+		sync.Format(L"%.3f fps, measuring...", m_dVideoFps);
 	} else {
-		sync.Format(L"Film %.3f i/s, \u00e9cran %.5f Hz (mesur\u00e9 sur %.0f s), vitesse x%.6f", m_dVideoFps, hz, secs, speed);
+		sync.Format(L"%.3f fps | %.5f Hz | audio %+.1f ppm | x%.7f", m_dVideoFps, hz, (audioRate - 1.0) * 1e6, speed);
 	}
 	return S_OK;
 }
@@ -3729,13 +3730,18 @@ double CMpcAudioRenderer::DetectVideoFps()
 
 void CMpcAudioRenderer::UpdateSyncSpeed()
 {
-	// Synchro facon ReClock : vitesse = rafraichissement reel / (k x cadence du film).
+	// ReClock-style sync: speed = real refresh / (k x film frame rate).
+	// The graph clock follows the audio device clock, so the display refresh must be
+	// expressed in audio-clock time: refresh(audio) = refresh(QPC) / audioRate.
 	double target = 1.0;
-	double hz = 0.0, secs = 0.0;
-	if (m_bVideoSync && m_dVideoFps > 0.0 && m_VSync.GetRefreshRate(hz, secs) && secs >= 15.0) {
-		const double k = std::floor(hz / m_dVideoFps + 0.5);
+	double hz = 0.0, secs = 0.0, audioRate = 0.0, audioSecs = 0.0;
+	const bool bHz = m_VSync.GetRefreshRate(hz, secs);
+	const bool bAudio = m_Atmos.GetAudioClockRate(audioRate, audioSecs);
+	if (m_bVideoSync && m_dVideoFps > 0.0 && bHz && secs >= 15.0 && bAudio && audioSecs >= 15.0) {
+		const double hzAudio = hz / audioRate;
+		const double k = std::floor(hzAudio / m_dVideoFps + 0.5);
 		if (k >= 1.0 && k <= 8.0) {
-			const double r = hz / (k * m_dVideoFps);
+			const double r = hzAudio / (k * m_dVideoFps);
 			if (std::abs(r - 1.0) <= 0.002) {
 				target = r;
 			}
@@ -3752,37 +3758,38 @@ void CMpcAudioRenderer::UpdateSyncSpeed()
 	}
 	static unsigned s_tick = 0;
 	if (++s_tick % 30 == 0) {
-		AtmosLog(L"Synchro : film %.3f i/s, ecran %.5f Hz (%.0f s de mesure), vitesse x%.6f", m_dVideoFps, hz, secs, next);
+		AtmosLog(L"Sync: film %.3f fps, display %.5f Hz (%.0f s), audio clock %+.1f ppm (%.0f s), speed x%.7f",
+				 m_dVideoFps, hz, secs, bAudio ? (audioRate - 1.0) * 1e6 : 0.0, audioSecs, next);
 	}
 }
 
 bool CMpcAudioRenderer::AtmosSupported()
 {
 	if (!m_bAtmosObjects) {
-		AtmosLog(L"AtmosSupported : option desactivee");
+		AtmosLog(L"AtmosSupported: option disabled");
 		return false;
 	}
 	if (!CAtmosOutput::LibraryAvailable()) {
-		AtmosLog(L"AtmosSupported : thdatmos.dll non chargee");
+		AtmosLog(L"AtmosSupported: thdatmos.dll not loaded");
 		return false;
 	}
 	if (!m_pMMDevice && FAILED(GetAudioDevice(FALSE))) {
-		AtmosLog(L"AtmosSupported : aucun peripherique audio");
+		AtmosLog(L"AtmosSupported: no audio device");
 		return false;
 	}
 	if (!m_pMMDevice) {
-		AtmosLog(L"AtmosSupported : aucun peripherique audio");
+		AtmosLog(L"AtmosSupported: no audio device");
 		return false;
 	}
 	CComPtr<ISpatialAudioClient> pSpatial;
 	HRESULT hr = m_pMMDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&pSpatial);
 	if (FAILED(hr)) {
-		AtmosLog(L"AtmosSupported : ISpatialAudioClient indisponible (0x%08x)", hr);
+		AtmosLog(L"AtmosSupported: ISpatialAudioClient unavailable (0x%08x)", hr);
 		return false;
 	}
 	hr = pSpatial->IsSpatialAudioStreamAvailable(__uuidof(ISpatialAudioObjectRenderStream), nullptr);
 	if (FAILED(hr)) {
-		AtmosLog(L"AtmosSupported : pas de son spatial actif sur '%s' (0x%08x)", m_strCurrentDeviceName.GetString(), hr);
+		AtmosLog(L"AtmosSupported: no spatial sound active on '%s' (0x%08x)", m_strCurrentDeviceName.GetString(), hr);
 		return false;
 	}
 	return true;

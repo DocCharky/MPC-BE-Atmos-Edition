@@ -1,14 +1,14 @@
 ﻿/*
  * AtmosOutput — MPC-BE Atmos Edition
  *
- * Décode le TrueHD (Atmos ou non) reçu emballé en IEC 61937 / MAT et le joue
- * par Windows Spatial Sound (« Dolby Atmos for home theater ») : chaque élément
- * de la piste devient un objet audio positionné. Le décodage TrueHD est assuré
- * par la bibliothèque thdatmos.dll (fondée sur truehdd, licence Apache 2.0).
+ * Decodes TrueHD (Atmos or not) received packed as IEC 61937 / MAT and plays it
+ * through Windows Spatial Sound ("Dolby Atmos for home theater"): each element
+ * of the track becomes a positioned audio object. TrueHD decoding is done by
+ * thdatmos.dll (based on truehdd, Apache 2.0 license).
  *
- * Synchronisation façon ReClock : quand elle est active, la lecture est
- * accélérée ou ralentie d'un facteur proche de 1 (rééchantillonnage) pour que
- * le film suive exactement la fréquence réelle de l'écran.
+ * ReClock-style sync: when enabled, playback is sped up or slowed down by a
+ * factor close to 1 (resampling) so that the film follows the real display
+ * refresh rate exactly.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -29,7 +29,7 @@
 #include <mutex>
 #include <vector>
 
-// Journal de diagnostic : atmos.log, a cote du module (.ax).
+// Diagnostic log: atmos.log, next to the module (.ax).
 void AtmosLog(const wchar_t* fmt, ...);
 
 class CAtmosOutput
@@ -38,36 +38,39 @@ public:
 	CAtmosOutput();
 	~CAtmosOutput();
 
-	// thdatmos.dll présente à côté du module et chargée ?
+	// Is thdatmos.dll present next to the module and loaded?
 	static bool LibraryAvailable();
 
-	// Ouvre le flux spatial sur le périphérique (mode « Dolby Atmos for home theater »
-	// actif requis) et démarre le rendu (silence tant que SetRunning(false)).
+	// Opens the spatial stream on the device ("Dolby Atmos for home theater" must be
+	// active) and starts rendering (silence while SetRunning(false)).
 	HRESULT Open(IMMDevice* pDevice);
 	void    Close();
 	bool    IsOpen() const { return m_pStream != nullptr; }
 
-	// Une salve IEC 61937 TrueHD. Bloque tant que la file dépasse ~1 s, sauf si
-	// hAbort1/hAbort2 sont signalés (arrêt, vidage).
+	// One IEC 61937 TrueHD burst. Blocks while more than ~1 s is queued, unless
+	// hAbort1/hAbort2 are signaled (stop, flush).
 	HRESULT Receive(const BYTE* pData, long size, REFERENCE_TIME rtStart, bool bDiscontinuity,
 					HANDLE hAbort1, HANDLE hAbort2);
 
-	void Flush();                     // vide la file et remet le décodeur à zéro
-	void SetRunning(bool bRunning);   // false : rendu de silence
-	void SetVolume(float volume);     // gain linéaire global
+	void Flush();                     // clears the queue and resets the decoder
+	void SetRunning(bool bRunning);   // false: render silence
+	void SetVolume(float volume);     // global linear gain
 
-	// Vitesse de lecture (1.0 = normale). Appliquée par rééchantillonnage.
+	// Playback speed (1.0 = normal), applied by resampling.
 	void   SetSpeed(double speed);
 	double GetSpeed();
 
 	IAudioClock*   GetAudioClock() const { return m_pAudioClock; }
+	// Audio clock rate relative to the system clock (QPC): audio seconds per
+	// system second (about 1 +/- a few ppm), and the measurement span in seconds.
+	bool           GetAudioClockRate(double& rate, double& seconds);
 	REFERENCE_TIME GetCurrentRenderedTime();
 	size_t         QueuedSamples();
 	unsigned       GetDynamicObjectCount() const { return m_nMaxDynamic; }
 
-	// Appelé par le fil de rendu quand l'horodatage saute (comme le renderer d'origine).
+	// Called by the render thread when timestamps jump (like the original renderer).
 	std::function<void(REFERENCE_TIME)> OnClockOffset;
-	// Appelé par le fil de rendu environ une fois par seconde (réglage de la vitesse).
+	// Called by the render thread about once a second (speed control).
 	std::function<void()> OnTick;
 
 	struct Element { uint32_t kind, active; float x, y, z, gain; };
@@ -82,7 +85,7 @@ private:
 		REFERENCE_TIME rtStart;
 		std::unique_ptr<Frame> f;
 	};
-	// Tronçon d'entrée tamponné : métadonnées valables à partir de l'échantillon start.
+	// Buffered input segment: metadata valid from sample `start`.
 	struct Segment {
 		uint64_t       start;
 		uint32_t       len;
@@ -94,8 +97,8 @@ private:
 	static DWORD WINAPI ThreadProc(LPVOID p) { return static_cast<CAtmosOutput*>(p)->RenderThread(); }
 	DWORD RenderThread();
 	void  RenderPeriod();
-	bool  PullFrame();                             // file -> tampon d'entrée (verrou tenu)
-	float Sample(unsigned c, int64_t index) const; // échantillon d'entrée (0 hors tampon)
+	bool  PullFrame();                             // queue -> input buffer (lock held)
+	float Sample(unsigned c, int64_t index) const; // input sample (0 outside the buffer)
 	const Segment* SegmentAt(uint64_t index) const;
 	void  ResetBuffers();
 
@@ -108,32 +111,43 @@ private:
 
 	HANDLE m_hBufferEvent = nullptr;
 	HANDLE m_hStopEvent = nullptr;
-	HANDLE m_hSpaceEvent = nullptr;   // signalé quand la file se vide
+	HANDLE m_hSpaceEvent = nullptr;   // signaled when the queue drains
 	HANDLE m_hThread = nullptr;
 
 	std::mutex              m_mutex;
 	std::deque<QueuedFrame> m_queue;
 	size_t                  m_nQueuedSamples = 0;
 
-	// Tampon d'entrée : m_in[c][k] = échantillon d'indice m_base + k
+	// Input buffer: m_in[c][k] = sample at index m_base + k
 	std::vector<float>  m_in[16];
 	uint64_t            m_base = 0;
-	uint64_t            m_end = 0;      // indice suivant le dernier échantillon tamponné
-	double              m_pos = 0.0;    // position de lecture (en échantillons d'entrée)
+	uint64_t            m_end = 0;      // index after the last buffered sample
+	double              m_pos = 0.0;    // read position (in input samples)
 	std::deque<Segment> m_segments;
 	REFERENCE_TIME      m_rtNextQueued = 0;
 
 	Element m_State[16] = {};
 	bool    m_bHaveState = false;
 
-	void*          m_pDecoder = nullptr; // contexte thdatmos
-	REFERENCE_TIME m_rtNextDecoded = INVALID_TIME_VALUE; // ancre (début de segment)
+	void*          m_pDecoder = nullptr; // thdatmos context
+	REFERENCE_TIME m_rtNextDecoded = INVALID_TIME_VALUE; // anchor (segment start)
 	uint64_t       m_nDecodedSinceAnchor = 0;
 	REFERENCE_TIME m_rtCurrentRendered = 0;
 	bool           m_bRunning = false;
 	float          m_fVolume = 1.0f;
 	double         m_dSpeed = 1.0;
 	DWORD          m_dwLastTick = 0;
+
+	// Audio clock vs system clock measurement (sliding window regression)
+	struct ClockSample { double qpc; double audio; };
+	std::deque<ClockSample> m_clockSamples;
+	std::mutex     m_clockMutex;
+	UINT64         m_clockFreq = 0;
+	DWORD          m_dwLastClockSample = 0;
+	double         m_audioRate = 0.0;
+	double         m_audioRateSeconds = 0.0;
+	void           SampleAudioClock();
+	void           FitAudioClock();
 
 	static constexpr REFERENCE_TIME INVALID_TIME_VALUE = INT64_MIN;
 };

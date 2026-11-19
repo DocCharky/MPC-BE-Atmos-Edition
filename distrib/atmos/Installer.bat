@@ -1,30 +1,29 @@
 @echo off
-chcp 65001 >nul
 net session >nul 2>&1
 if errorlevel 1 (
-  echo Ce programme doit etre lance en administrateur.
-  echo Clic droit sur Installer.bat, puis "Executer en tant qu'administrateur".
+  echo This script must be run as administrator.
+  echo Right-click Installer.bat, then "Run as administrator".
   pause
   exit /b 1
 )
 cd /d "%~dp0"
 if not exist "thdatmos.dll" (
-  echo ERREUR : thdatmos.dll doit etre dans le meme dossier que MpcAudioRendererAtmos.ax.
+  echo ERROR: thdatmos.dll must be in the same folder as MpcAudioRendererAtmos.ax.
   pause
   exit /b 1
 )
 regsvr32 /s "%~dp0MpcAudioRendererAtmos.ax"
 if errorlevel 1 (
-  echo ERREUR : l'enregistrement du renderer a echoue.
+  echo ERROR: registering the renderer failed.
   pause
   exit /b 1
 )
 echo.
-echo MPC Audio Renderer Atmos est installe.
+echo MPC Audio Renderer Atmos is installed.
 echo.
-echo Dans MPC-BE : Options ^> Lecture ^> Sortie ^> Audio Renderer : choisir "MPC Audio Renderer Atmos".
-echo Decodeur audio de MPC-BE : TrueHD coche, AC-3 / E-AC-3 / DTS / DTS-HD decoches.
-echo Windows : sortie HDMI ^> Son spatial ^> "Dolby Atmos for home theater".
+echo MPC-BE: Options ^> Audio ^> Audio renderer: select "MPC Audio Renderer Atmos (external)".
+echo MPC-BE audio decoder: TrueHD pass-through ON, other formats OFF.
+echo Windows: HDMI output ^> Spatial sound ^> "Dolby Atmos for home theater".
 echo.
-echo Ne deplacez plus ce dossier : pour le changer de place, desinstallez d'abord.
+echo Do not move this folder: to move it, uninstall first.
 pause

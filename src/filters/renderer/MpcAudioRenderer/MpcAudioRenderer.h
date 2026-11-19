@@ -81,11 +81,11 @@ class __declspec(uuid("601D2A2B-9CDE-40bd-8650-0485E3522727"))
 
 	BOOL              m_bDVDPlayback;
 
-	// Atmos Edition : TrueHD decode et joue en objets par Windows Spatial Sound
+	// Atmos Edition: TrueHD decoded and played as Windows Spatial Sound objects
 	CAtmosOutput      m_Atmos;
 	bool              m_bAtmos = false;
-	BOOL              m_bAtmosObjects = TRUE; // option : TrueHD -> objets Atmos
-	BOOL              m_bVideoSync = TRUE;    // option : synchro facon ReClock
+	BOOL              m_bAtmosObjects = TRUE; // option: TrueHD -> Atmos objects
+	BOOL              m_bVideoSync = TRUE;    // option: ReClock-style display sync
 	CVSyncMeter       m_VSync;
 	double            m_dVideoFps = 0.0;
 	double            DetectVideoFps();

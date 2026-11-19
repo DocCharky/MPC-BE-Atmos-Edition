@@ -1,6 +1,6 @@
-//! thdatmos — décodage TrueHD Atmos en temps réel (via la bibliothèque `truehd`
-//! du projet truehdd) et exposition, par une API C, des échantillons de chaque
-//! élément (bed ou objet) avec sa position, son gain et son état.
+//! thdatmos — real-time TrueHD Atmos decoding (using the `truehd` library from
+//! the truehdd project), exposing through a C API the samples of each element
+//! (bed channel or object) with its position, gain and state.
 
 use std::collections::VecDeque;
 use std::ffi::{CString, c_char};
@@ -19,32 +19,32 @@ use truehd::structs::oamd::{GAIN_MINUS_INFINITY, ObjectAudioMetadataPayload, Spe
 pub const MAX_CH: usize = 16;
 pub const MAX_SAMPLES: usize = 160;
 
-/// Nature d'un élément.
-pub const KIND_OBJECT: u32 = 0; // objet (ou canal de bed positionné à son enceinte)
-pub const KIND_LFE: u32 = 1; // canal de caisson de basses
+/// Element kind.
+pub const KIND_OBJECT: u32 = 0; // object (or bed channel placed at its speaker)
+pub const KIND_LFE: u32 = 1; // LFE channel
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ThdElement {
     pub kind: u32,
     pub active: u32,
-    /// Position DAMF : x gauche(-1)/droite(+1), y arrière(-1)/avant(+1), z sol(0)/plafond(1).
+    /// DAMF position: x left(-1)/right(+1), y back(-1)/front(+1), z floor(0)/ceiling(1).
     pub x: f32,
     pub y: f32,
     pub z: f32,
-    /// Gain linéaire.
+    /// Linear gain.
     pub gain: f32,
 }
 
 #[repr(C)]
 pub struct ThdFrame {
-    /// Position du premier échantillon, en échantillons depuis le début du flux.
+    /// Position of the first sample, in samples from the start of the stream.
     pub sample_pos: u64,
     pub samples: u32,
     pub channels: u32,
-    /// Fréquence d'échantillonnage (Hz).
+    /// Sample rate (Hz).
     pub sample_rate: u32,
-    /// PCM flottant [-1, 1], entrelacé : pcm[échantillon][élément].
+    /// Float PCM [-1, 1], interleaved: pcm[sample][element].
     pub pcm: [[f32; MAX_CH]; MAX_SAMPLES],
     pub elements: [ThdElement; MAX_CH],
 }
@@ -67,22 +67,22 @@ impl Source {
                 e == "mkv" || e == "mka" || e == "mk3d"
             })
             .unwrap_or(false);
-        let file = File::open(&path).map_err(|e| format!("ouverture impossible : {e}"))?;
+        let file = File::open(&path).map_err(|e| format!("cannot open file: {e}"))?;
         let reader = BufReader::with_capacity(1 << 20, file);
         if !is_mkv {
             return Ok(Source::Raw(reader));
         }
-        let mkv = MatroskaFile::open(reader).map_err(|e| format!("MKV illisible : {e}"))?;
+        let mkv = MatroskaFile::open(reader).map_err(|e| format!("unreadable MKV: {e}"))?;
         let track = mkv
             .tracks()
             .iter()
             .find(|t| t.codec_id() == "A_TRUEHD")
             .map(|t| t.track_number().get())
-            .ok_or_else(|| "aucune piste TrueHD dans ce fichier".to_string())?;
+            .ok_or_else(|| "no TrueHD track in this file".to_string())?;
         Ok(Source::Mkv { mkv: Box::new(mkv), track, frame: MkvFrame::default() })
     }
 
-    /// Renvoie le prochain morceau de flux TrueHD, ou None en fin de fichier.
+    /// Returns the next chunk of TrueHD stream, or false at end of file.
     fn next_chunk(&mut self, buf: &mut Vec<u8>) -> Result<bool, String> {
         buf.clear();
         match self {
@@ -101,7 +101,7 @@ impl Source {
                         }
                     }
                     Ok(false) => return Ok(false),
-                    Err(e) => return Err(format!("lecture MKV : {e}")),
+                    Err(e) => return Err(format!("MKV read error: {e}")),
                 }
             },
         }
@@ -140,8 +140,8 @@ impl Ctx {
 
     pub fn new() -> Self {
         let mut required = [false; MAX_PRESENTATIONS];
-        required[2] = true; // 8 canaux (repli sans Atmos)
-        required[3] = true; // Atmos (16 éléments)
+        required[2] = true; // 8 channels (non-Atmos fallback)
+        required[3] = true; // Atmos (16 elements)
         let mut parser = Parser::default();
         parser.set_required_presentations(&required);
         Ctx {
@@ -162,7 +162,7 @@ impl Ctx {
         }
     }
 
-    /// Remet le décodeur à zéro (recherche, vidage).
+    /// Resets the decoder (seek, flush).
     pub fn reset(&mut self) {
         let required = self.required;
         let mut parser = Parser::default();
@@ -178,14 +178,14 @@ impl Ctx {
         self.atmos_seen = false;
     }
 
-    /// Ajoute des octets de flux TrueHD brut.
+    /// Pushes raw TrueHD stream bytes.
     pub fn push(&mut self, data: &[u8]) {
         self.extractor.push_bytes(data);
         self.drain_extractor();
     }
 
-    /// Ajoute une salve IEC 61937 (TrueHD emballé en trame MAT, telle que la
-    /// produit le décodeur de MPC-BE). Renvoie false si la salve n'est pas du TrueHD.
+    /// Pushes one IEC 61937 burst (TrueHD packed in a MAT frame, as produced by the
+    /// MPC-BE audio decoder). Returns false if the burst is not TrueHD.
     pub fn push_iec61937(&mut self, burst: &[u8]) -> bool {
         let mut out = Vec::with_capacity(MAT_SIZE);
         if !self.mat.unpack(burst, &mut out) {
@@ -195,12 +195,12 @@ impl Ctx {
         true
     }
 
-    /// Trame décodée suivante, si disponible.
+    /// Next decoded frame, if any.
     pub fn pull(&mut self) -> Option<Box<ThdFrame>> {
         self.queue.pop_front()
     }
 
-    /// Renvoie la prochaine trame décodée (Ok(None) en fin de flux). Mode fichier.
+    /// Returns the next decoded frame (Ok(None) at end of stream). File mode.
     pub fn read(&mut self) -> Result<Option<Box<ThdFrame>>, String> {
         while self.queue.is_empty() {
             if self.eof {
@@ -223,7 +223,7 @@ impl Ctx {
             let frame = match res {
                 Ok(f) => f,
                 Err(truehd::utils::errors::ExtractError::InsufficientData) => break,
-                Err(_) => continue, // l'extracteur se resynchronise seul
+                Err(_) => continue, // the extractor resyncs by itself
             };
             let au = match self.parser.parse(&frame) {
                 Ok(au) => au,
@@ -256,7 +256,7 @@ impl Ctx {
         let n = d.sample_length.min(MAX_SAMPLES);
         let end = self.total + n as u64;
 
-        // Applique les mises à jour de métadonnées échues avant la fin de cette trame.
+        // Apply metadata updates due before the end of this frame.
         let mut i = 0;
         while i < self.pending.len() {
             if self.pending[i].pos < end {
@@ -269,7 +269,7 @@ impl Ctx {
 
         let ch = d.channel_count.min(MAX_CH);
         if d.oamd.is_empty() && !self.atmos_seen {
-            // Piste sans Atmos : chaque canal devient un objet fixe à la place de son enceinte.
+            // Non-Atmos track: each channel becomes a fixed object at its speaker position.
             for (c, l) in d.channel_labels.iter().take(ch).enumerate() {
                 self.elements[c] = channel_element(l);
             }
@@ -371,22 +371,22 @@ fn channel_element(l: &ChannelLabel) -> ThdElement {
     ThdElement { kind: KIND_OBJECT, active: 1, x, y, z, gain: 1.0 }
 }
 
-// ------------------------------------------------------- Déballage MAT ---
+// ------------------------------------------------------- MAT unpacking ---
 
-/// Taille d'une salve IEC 61937 TrueHD (en-tête 8 octets + trame MAT).
+/// Size of an IEC 61937 TrueHD burst (8-byte header + MAT frame).
 pub const MAT_SIZE: usize = 61440;
 const IEC_HEADER: usize = 8;
-const MAT_START_END: usize = IEC_HEADER + 20; // fin du code de début MAT
-const MAT_MIDDLE: usize = 30708 + IEC_HEADER; // position du code du milieu
+const MAT_START_END: usize = IEC_HEADER + 20; // end of the MAT start code
+const MAT_MIDDLE: usize = 30708 + IEC_HEADER; // position of the middle code
 const MAT_MIDDLE_END: usize = MAT_MIDDLE + 12;
-const MAT_LIMIT: usize = MAT_SIZE - 24; // début du code de fin
+const MAT_LIMIT: usize = MAT_SIZE - 24; // start of the end code
 const IEC61937_TRUEHD: u8 = 0x16;
 
-/// Reconstitue le flux TrueHD à partir des trames MAT : retire l'en-tête IEC,
-/// l'inversion d'octets, les codes MAT et le bourrage entre unités d'accès.
+/// Rebuilds the TrueHD stream from MAT frames: removes the IEC header, the byte
+/// swapping, the MAT codes and the padding between access units.
 #[derive(Default)]
 struct MatUnpacker {
-    carry: Vec<u8>, // données utiles en attente (unité d'accès incomplète)
+    carry: Vec<u8>, // pending payload (incomplete access unit)
 }
 
 impl MatUnpacker {
@@ -394,11 +394,11 @@ impl MatUnpacker {
         if burst.len() < MAT_LIMIT {
             return false;
         }
-        // En-tête IEC 61937 : mots 16 bits petit-boutistes Pa=F872, Pb=4E1F, Pc=type.
+        // IEC 61937 header: little-endian 16-bit words Pa=F872, Pb=4E1F, Pc=type.
         if burst[0] != 0x72 || burst[1] != 0xF8 || burst[2] != 0x1F || burst[3] != 0x4E || burst[4] != IEC61937_TRUEHD {
             return false;
         }
-        // Charge utile inversée par paires d'octets.
+        // Payload is byte-swapped in pairs.
         let mut swapped = vec![0u8; MAT_LIMIT];
         let mut i = IEC_HEADER;
         while i + 1 < MAT_LIMIT {
@@ -409,7 +409,7 @@ impl MatUnpacker {
         self.carry.extend_from_slice(&swapped[MAT_START_END..MAT_MIDDLE]);
         self.carry.extend_from_slice(&swapped[MAT_MIDDLE_END..MAT_LIMIT]);
 
-        // Découpe en unités d'accès ; les mots nuls sont du bourrage.
+        // Split into access units; zero words are padding.
         let buf = &self.carry;
         let mut p = 0;
         while p + 2 <= buf.len() {
@@ -420,11 +420,11 @@ impl MatUnpacker {
             }
             let len = ((w & 0x0FFF) as usize) * 2;
             if len < 4 {
-                p += 2; // incohérent : on avance, l'extracteur se resynchronisera
+                p += 2; // inconsistent: skip, the extractor will resync
                 continue;
             }
             if p + len > buf.len() {
-                break; // unité à cheval sur la trame MAT suivante
+                break; // unit continues in the next MAT frame
             }
             out.extend_from_slice(&buf[p..p + len]);
             p += len;
@@ -437,9 +437,9 @@ impl MatUnpacker {
     }
 }
 
-// ---------------------------------------------------------------- API C ---
+// ------------------------------------------------------------------ C API ---
 
-/// Crée un décodeur alimenté par thd_push / thd_push_iec61937.
+/// Creates a decoder fed by thd_push / thd_push_iec61937.
 #[unsafe(no_mangle)]
 pub extern "C" fn thd_create() -> *mut Ctx {
     Box::into_raw(Box::new(Ctx::new()))
@@ -450,21 +450,21 @@ pub unsafe extern "C" fn thd_reset(ctx: *mut Ctx) {
     unsafe { &mut *ctx }.reset();
 }
 
-/// Flux TrueHD brut.
+/// Raw TrueHD stream.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thd_push(ctx: *mut Ctx, data: *const u8, len: usize) {
     let ctx = unsafe { &mut *ctx };
     ctx.push(unsafe { std::slice::from_raw_parts(data, len) });
 }
 
-/// Salve IEC 61937 TrueHD (trame MAT). Renvoie 1 si acceptée, 0 sinon.
+/// IEC 61937 TrueHD burst (MAT frame). Returns 1 if accepted, 0 otherwise.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thd_push_iec61937(ctx: *mut Ctx, data: *const u8, len: usize) -> i32 {
     let ctx = unsafe { &mut *ctx };
     ctx.push_iec61937(unsafe { std::slice::from_raw_parts(data, len) }) as i32
 }
 
-/// Trame décodée suivante : 1 si `out` est rempli, 0 s'il faut plus de données.
+/// Next decoded frame: 1 if `out` was filled, 0 if more data is needed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thd_pull(ctx: *mut Ctx, out: *mut ThdFrame) -> i32 {
     let ctx = unsafe { &mut *ctx };
@@ -478,9 +478,9 @@ pub unsafe extern "C" fn thd_pull(ctx: *mut Ctx, out: *mut ThdFrame) -> i32 {
 }
 
 
-/// Ouvre un fichier .mkv/.mka (première piste TrueHD) ou un flux .thd brut.
-/// `path` : chemin UTF-16 terminé par 0. Renvoie NULL en cas d'échec
-/// (message dans `err`, tampon de `err_len` octets, UTF-8).
+/// Opens a .mkv/.mka file (first TrueHD track) or a raw .thd stream.
+/// `path`: zero-terminated UTF-16 path. Returns NULL on failure
+/// (message in `err`, buffer of `err_len` bytes, UTF-8).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thd_open(path: *const u16, err: *mut c_char, err_len: usize) -> *mut Ctx {
     let path = unsafe {
@@ -499,7 +499,7 @@ pub unsafe extern "C" fn thd_open(path: *const u16, err: *mut c_char, err_len: u
     }
 }
 
-/// Lit la trame suivante dans `out`. Renvoie 1 (trame), 0 (fin), -1 (erreur, voir thd_error).
+/// Reads the next frame into `out`. Returns 1 (frame), 0 (end), -1 (error, see thd_error).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thd_read(ctx: *mut Ctx, out: *mut ThdFrame) -> i32 {
     let ctx = unsafe { &mut *ctx };

@@ -99,9 +99,9 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 	p.y += h20;
 	m_cbPauseKeepActive.Create(ResStr(IDS_ARS_PAUSE_KEEP_ACTIVE), dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_PAUSE_KEEP_ACTIVE);
 	p.y += h20;
-	m_cbAtmosObjects.Create(L"TrueHD : d\u00e9coder et envoyer en objets Atmos (Windows)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_ATMOS_OBJECTS);
+	m_cbAtmosObjects.Create(L"TrueHD: decode and output as Atmos objects (Windows Spatial Sound)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_ATMOS_OBJECTS);
 	p.y += h20;
-	m_cbVideoSync.Create(L"Caler le son sur l'\u00e9cran (fa\u00e7on ReClock, r\u00e9\u00e9chantillonne)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_VIDEO_SYNC);
+	m_cbVideoSync.Create(L"Sync audio to display refresh (ReClock-style, resamples)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_VIDEO_SYNC);
 	p.y += h20;
 	p.x += ScaleX(240);
 	m_btnReset.Create(ResStr(IDS_FILTER_RESET_SETTINGS), dwStyle | BS_MULTILINE, CRect(p, CSize(ScaleX(80), ScaleX(32))), this, IDC_PP_RESET);
@@ -355,6 +355,16 @@ void CMpcAudioRendererStatusWnd::UpdateStatus()
 		m_edtMode.SetWindowTextW(modeStr);
 		m_edtSync.SetWindowTextW(atmosSync);
 
+		if (!atmosOut.IsEmpty()) {
+			m_InputFormatText.SetWindowTextW(L"TrueHD (bitstream)");
+			m_InputRateText.SetWindowTextW(L"48000");
+			m_InputChannelText.SetWindowTextW(L"Atmos / 16 max");
+			m_OutputFormatText.SetWindowTextW(L"32-bit Float");
+			m_OutputRateText.SetWindowTextW(L"48000");
+			m_OutputChannelText.SetWindowTextW(L"Spatial objects");
+			return;
+		}
+
 		if (status == MODE_WASAPI_EXCLUSIVE_BITSTREAM) {
 			m_InputFormatText.SetWindowTextW(L"Bitstream");
 			m_OutputFormatText.SetWindowTextW(L"Bitstream");
@@ -452,7 +462,7 @@ bool CMpcAudioRendererStatusWnd::OnActivate()
 {
 	CRect rect;
 	const long w1 = 70;  // device, mode
-	const long w2 = 280; // values
+	const long w2 = 305; // values
 	const long w3 = 78;  // format, channels, samplerate
 	const long w4 = 110; // values
 
@@ -475,7 +485,7 @@ bool CMpcAudioRendererStatusWnd::OnActivate()
 
 	y += 20;
 	CalcTextRect(rect, x1, y, w1);
-	m_txtSync.Create(L"Synchro :", WS_VISIBLE | WS_CHILD, rect, this, (UINT)IDC_STATIC);
+	m_txtSync.Create(L"Sync:", WS_VISIBLE | WS_CHILD, rect, this, (UINT)IDC_STATIC);
 	CalcTextRect(rect, x1+w1, y, w2);
 	m_edtSync.Create(WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY, rect, this, (UINT)IDC_STATIC);
 

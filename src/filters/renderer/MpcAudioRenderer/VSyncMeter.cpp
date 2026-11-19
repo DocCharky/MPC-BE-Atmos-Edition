@@ -1,5 +1,5 @@
 ﻿/*
- * VSyncMeter — MPC-BE Atmos Edition (voir VSyncMeter.h)
+ * VSyncMeter — MPC-BE Atmos Edition (see VSyncMeter.h)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -13,7 +13,7 @@
 
 namespace
 {
-	// Structures D3DKMT (d3dkmthk.h), déclarées ici pour ne pas dépendre du WDK.
+	// D3DKMT structures (d3dkmthk.h), declared here to avoid depending on the WDK.
 	typedef UINT D3DKMT_HANDLE;
 	struct KMT_OPENADAPTERFROMHDC { HDC hDc; D3DKMT_HANDLE hAdapter; LUID AdapterLuid; UINT VidPnSourceId; };
 	struct KMT_WAITFORVERTICALBLANKEVENT { D3DKMT_HANDLE hAdapter; D3DKMT_HANDLE hDevice; UINT VidPnSourceId; };
@@ -22,7 +22,7 @@ namespace
 	typedef LONG (APIENTRY *PFN_WaitForVerticalBlankEvent)(const KMT_WAITFORVERTICALBLANKEVENT*);
 	typedef LONG (APIENTRY *PFN_CloseAdapter)(const KMT_CLOSEADAPTER*);
 
-	constexpr double WINDOW_SECONDS = 120.0; // fenêtre de mesure glissante
+	constexpr double WINDOW_SECONDS = 120.0; // sliding measurement window
 }
 
 CVSyncMeter::CVSyncMeter()
@@ -97,7 +97,7 @@ void CVSyncMeter::AddVBlank(LONGLONG qpc)
 	}
 
 	if (m_period == 0.0) {
-		// Première estimation : on attend quelques intervalles cohérents.
+		// First estimate.
 		m_period = dt;
 		m_index += 1.0;
 		m_samples.push_back({ m_index, t });
@@ -107,7 +107,7 @@ void CVSyncMeter::AddVBlank(LONGLONG qpc)
 	const double n = std::floor(dt / m_period + 0.5);
 	const double err = std::fabs(dt / (n > 0 ? n : 1) - m_period) / m_period;
 	if (n < 1 || n > 10 || err > 0.15) {
-		// Intervalle aberrant ; s'ils se répètent, la fréquence a changé (changement de mode).
+		// Outlier interval; if they persist, the refresh rate changed (mode switch).
 		if (++m_outliers > 10) {
 			m_samples.clear();
 			m_index = 0.0;
@@ -126,7 +126,7 @@ void CVSyncMeter::AddVBlank(LONGLONG qpc)
 		m_samples.pop_front();
 	}
 
-	// Régression linéaire t = a + période * index sur la fenêtre (environ deux fois par seconde).
+	// Linear regression t = a + period * index over the window (about twice a second).
 	if (m_samples.size() >= 30 && (++m_fitCounter % 30) == 0) {
 		const double i0 = m_samples.front().index, t0 = m_samples.front().t;
 		double si = 0, st = 0, sii = 0, sit = 0;
@@ -160,7 +160,7 @@ DWORD CVSyncMeter::Run()
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
 	while (!m_bStop) {
-		// Écran principal (le téléviseur sur un HTPC).
+		// Primary display (the TV on an HTPC).
 		MONITORINFOEXW mi = {};
 		mi.cbSize = sizeof(mi);
 		HMONITOR hMon = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
@@ -187,7 +187,7 @@ DWORD CVSyncMeter::Run()
 		we.VidPnSourceId = oa.VidPnSourceId;
 		while (!m_bStop) {
 			if (pWait(&we) != 0) {
-				break; // adaptateur perdu (changement de mode) : on rouvre
+				break; // adapter lost (mode switch): reopen
 			}
 			LARGE_INTEGER now;
 			QueryPerformanceCounter(&now);

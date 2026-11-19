@@ -37,7 +37,7 @@ public:
 	void UnSlave();
 	const bool IsSlave() const { return m_pAudioClock != nullptr; }
 	void OffsetAudioClock(const REFERENCE_TIME offsetTime);
-	// Atmos Edition : vitesse de l'horloge par rapport a la carte son (synchro ecran)
+	// Atmos Edition: clock speed relative to the audio device (display sync)
 	void SetSpeed(double speed);
 	double GetSpeed() const { return m_speed; }
 

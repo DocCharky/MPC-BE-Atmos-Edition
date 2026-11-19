@@ -1,5 +1,5 @@
 ﻿/*
- * AtmosOutput — MPC-BE Atmos Edition (voir AtmosOutput.h)
+ * AtmosOutput — MPC-BE Atmos Edition (see AtmosOutput.h)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -41,7 +41,7 @@ namespace
 			}
 			tried = true;
 			wchar_t path[MAX_PATH] = {};
-			// thdatmos.dll est cherchee a cote du module qui contient ce code (.ax ou .exe).
+			// thdatmos.dll is loaded from the folder of the module containing this code (.ax or .exe).
 			HMODULE hSelf = nullptr;
 			GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 							   (LPCWSTR)&s_moduleAnchor, &hSelf);
@@ -51,7 +51,7 @@ namespace
 			}
 			hLib = LoadLibraryW(path);
 			if (!hLib) {
-				AtmosLog(L"thdatmos.dll introuvable ou illisible : %s (erreur %u)", path, GetLastError());
+				AtmosLog(L"thdatmos.dll not found or unreadable: %s (error %u)", path, GetLastError());
 				return false;
 			}
 			create = (PFN_thd_create)GetProcAddress(hLib, "thd_create");
@@ -60,11 +60,11 @@ namespace
 			pull   = (PFN_thd_pull)GetProcAddress(hLib, "thd_pull");
 			close  = (PFN_thd_close)GetProcAddress(hLib, "thd_close");
 			if (!create || !reset || !push || !pull || !close) {
-				AtmosLog(L"thdatmos.dll : fonctions manquantes");
+				AtmosLog(L"thdatmos.dll: missing exports");
 				FreeLibrary(hLib);
 				hLib = nullptr;
 			} else {
-				AtmosLog(L"thdatmos.dll chargee : %s", path);
+				AtmosLog(L"thdatmos.dll loaded: %s", path);
 			}
 			return hLib != nullptr;
 		}
@@ -73,14 +73,14 @@ namespace
 
 	constexpr uint32_t KIND_LFE = 1;
 	constexpr REFERENCE_TIME UNITS_PER_SEC = 10000000;
-	constexpr size_t MAX_QUEUE_SAMPLES = 48000;   // ~1 s d'avance
+	constexpr size_t MAX_QUEUE_SAMPLES = 48000;   // ~1 s ahead
 	constexpr uint32_t SAMPLE_RATE = 48000;
 
 	inline REFERENCE_TIME SamplesToTime(uint64_t n) { return (REFERENCE_TIME)(n * UNITS_PER_SEC / SAMPLE_RATE); }
 
 	template <class T> void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
-	// Noyau d'interpolation sinc fenêtré (Kaiser), 48 coefficients, 2048 phases (~110 dB).
+	// Kaiser-windowed sinc interpolation kernel, 48 taps, 2048 phases (~110 dB).
 	constexpr int KERNEL_HALF = 24;
 	constexpr int KERNEL_PHASES = 2048;
 
@@ -105,7 +105,7 @@ namespace
 			for (int ph = 0; ph <= KERNEL_PHASES; ph++) {
 				const double frac = (double)ph / KERNEL_PHASES;
 				for (int k = 0; k < 2 * KERNEL_HALF; k++) {
-					// distance entre l'échantillon k et la position fractionnaire
+					// distance between sample k and the fractional position
 					const double t = (double)(k - KERNEL_HALF + 1) - frac;
 					const double x = 3.14159265358979323846 * cutoff * t;
 					const double sinc = (std::fabs(t) < 1e-12) ? 1.0 : std::sin(x) / x;
@@ -172,18 +172,18 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 		return S_OK;
 	}
 	if (!pDevice || !LibraryAvailable()) {
-		AtmosLog(L"Open : pas de peripherique ou pas de thdatmos.dll");
+		AtmosLog(L"Open: no device or no thdatmos.dll");
 		return E_FAIL;
 	}
 
 	HRESULT hr = pDevice->Activate(__uuidof(ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**)&m_pClient);
 	if (FAILED(hr)) {
-		AtmosLog(L"Open : ISpatialAudioClient indisponible (0x%08x)", hr);
+		AtmosLog(L"Open: ISpatialAudioClient unavailable (0x%08x)", hr);
 		return hr;
 	}
 	hr = m_pClient->IsSpatialAudioStreamAvailable(__uuidof(ISpatialAudioObjectRenderStream), nullptr);
 	if (FAILED(hr)) {
-		AtmosLog(L"Open : aucun format spatial actif (0x%08x)", hr);
+		AtmosLog(L"Open: no spatial sound format active (0x%08x)", hr);
 		Close();
 		return hr;
 	}
@@ -191,9 +191,9 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	UINT32 maxDyn = 0;
 	m_pClient->GetMaxDynamicObjectCount(&maxDyn);
 	m_nMaxDynamic = std::min<UINT32>(maxDyn, 16);
-	AtmosLog(L"Open : %u objets dynamiques disponibles", maxDyn);
-	if (m_nMaxDynamic < 15) { // une piste Atmos de Blu-ray compte jusqu'à 15 objets + LFE
-		AtmosLog(L"Open : pas assez d'objets dynamiques");
+	AtmosLog(L"Open: %u dynamic objects available", maxDyn);
+	if (m_nMaxDynamic < 15) { // a Blu-ray Atmos track has up to 15 objects + LFE
+		AtmosLog(L"Open: not enough dynamic objects");
 		Close();
 		return E_FAIL;
 	}
@@ -207,7 +207,7 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	wf.nAvgBytesPerSec = SAMPLE_RATE * 4;
 	hr = m_pClient->IsAudioObjectFormatSupported(&wf);
 	if (FAILED(hr)) {
-		AtmosLog(L"Open : format 48 kHz float refuse (0x%08x)", hr);
+		AtmosLog(L"Open: 48 kHz float format refused (0x%08x)", hr);
 		Close();
 		return hr;
 	}
@@ -230,14 +230,20 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	act.blob.pBlobData = (BYTE*)&p;
 	hr = m_pClient->ActivateSpatialAudioStream(&act, __uuidof(ISpatialAudioObjectRenderStream), (void**)&m_pStream);
 	if (FAILED(hr)) {
-		AtmosLog(L"Open : ActivateSpatialAudioStream a echoue (0x%08x)", hr);
+		AtmosLog(L"Open: ActivateSpatialAudioStream failed (0x%08x)", hr);
 		Close();
 		return hr;
 	}
 
 	hr = m_pStream->GetService(__uuidof(IAudioClock), (void**)&m_pAudioClock);
+	if (SUCCEEDED(hr)) {
+		m_pAudioClock->GetFrequency(&m_clockFreq);
+		std::lock_guard<std::mutex> lock(m_clockMutex);
+		m_clockSamples.clear();
+		m_audioRate = m_audioRateSeconds = 0.0;
+	}
 	if (FAILED(hr)) {
-		AtmosLog(L"Open : IAudioClock indisponible (0x%08x)", hr);
+		AtmosLog(L"Open: IAudioClock unavailable (0x%08x)", hr);
 		Close();
 		return hr;
 	}
@@ -247,11 +253,11 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 	ResetEvent(m_hStopEvent);
 	hr = m_pStream->Start();
 	if (FAILED(hr)) {
-		AtmosLog(L"Open : Start a echoue (0x%08x)", hr);
+		AtmosLog(L"Open: Start failed (0x%08x)", hr);
 		Close();
 		return hr;
 	}
-	AtmosLog(L"Open : flux spatial ouvert");
+	AtmosLog(L"Open: spatial stream opened");
 	m_hThread = CreateThread(nullptr, 0, ThreadProc, this, 0, nullptr);
 
 	return S_OK;
@@ -296,7 +302,7 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 		return E_FAIL;
 	}
 
-	// Contre-pression : on n'avance pas de plus d'environ une seconde sur la lecture.
+	// Back-pressure: stay at most about one second ahead of playback.
 	for (;;) {
 		{
 			std::lock_guard<std::mutex> lock(m_mutex);
@@ -315,10 +321,10 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 	if (!g_thd.push(m_pDecoder, pData, (size_t)size)) {
 		static int s_badLogged = 0;
 		if (s_badLogged++ < 3) {
-			AtmosLog(L"Receive : salve non reconnue (%ld octets, debut %02x %02x %02x %02x %02x)", size,
+			AtmosLog(L"Receive: unrecognized burst (%ld bytes, starts %02x %02x %02x %02x %02x)", size,
 					 size > 0 ? pData[0] : 0, size > 1 ? pData[1] : 0, size > 2 ? pData[2] : 0, size > 3 ? pData[3] : 0, size > 4 ? pData[4] : 0);
 		}
-		return S_FALSE; // pas du TrueHD emballé
+		return S_FALSE; // not packed TrueHD
 	}
 
 	auto frame = std::make_unique<Frame>();
@@ -327,10 +333,10 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 			continue;
 		}
 		if (frame->sample_rate != SAMPLE_RATE) {
-			// Le flux spatial est en 48 kHz : 96/192 kHz ramenés par moyenne (pistes non-Atmos rares).
+			// The spatial stream runs at 48 kHz: 96/192 kHz are averaged down (rare non-Atmos tracks).
 			const uint32_t f = frame->sample_rate / SAMPLE_RATE;
 			if (f < 2 || frame->sample_rate % SAMPLE_RATE) {
-				continue; // 44,1 kHz et dérivés : non gérés
+				continue; // 44.1 kHz family: not supported
 			}
 			const uint32_t n = frame->samples / f;
 			for (uint32_t s = 0; s < n; s++) {
@@ -349,7 +355,7 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 			}
 		}
 		if (m_rtNextDecoded == INVALID_TIME_VALUE || bDiscontinuity) {
-			// Ancrage de l'horodatage : début de la salve en cours.
+			// Timestamp anchor: start of the current burst.
 			m_rtNextDecoded = rtStart;
 			m_nDecodedSinceAnchor = 0;
 			bDiscontinuity = false;
@@ -460,14 +466,76 @@ DWORD CAtmosOutput::RenderThread()
 			RenderPeriod();
 		}
 		const DWORD now = GetTickCount();
+		if (now - m_dwLastClockSample >= 100) {
+			m_dwLastClockSample = now;
+			SampleAudioClock();
+		}
 		if (now - m_dwLastTick >= 1000) {
 			m_dwLastTick = now;
+			FitAudioClock();
 			if (OnTick) {
 				OnTick();
 			}
 		}
 	}
 	return 0;
+}
+
+void CAtmosOutput::SampleAudioClock()
+{
+	if (!m_pAudioClock || !m_clockFreq) {
+		return;
+	}
+	UINT64 pos = 0, qpcPos = 0;
+	if (FAILED(m_pAudioClock->GetPosition(&pos, &qpcPos)) || !qpcPos) {
+		return;
+	}
+	const double qpc = qpcPos / 1e7;                // 100 ns units
+	const double audio = (double)pos / (double)m_clockFreq;
+	std::lock_guard<std::mutex> lock(m_clockMutex);
+	if (!m_clockSamples.empty()) {
+		const ClockSample& last = m_clockSamples.back();
+		// A glitch or stream restart breaks the linear relation: start over.
+		if (qpc <= last.qpc || std::fabs((audio - last.audio) - (qpc - last.qpc)) > 0.05) {
+			m_clockSamples.clear();
+		}
+	}
+	m_clockSamples.push_back({ qpc, audio });
+	while (!m_clockSamples.empty() && qpc - m_clockSamples.front().qpc > 120.0) {
+		m_clockSamples.pop_front();
+	}
+}
+
+void CAtmosOutput::FitAudioClock()
+{
+	std::lock_guard<std::mutex> lock(m_clockMutex);
+	if (m_clockSamples.size() < 50) {
+		m_audioRate = m_audioRateSeconds = 0.0;
+		return;
+	}
+	const double x0 = m_clockSamples.front().qpc, y0 = m_clockSamples.front().audio;
+	double sx = 0, sy = 0, sxx = 0, sxy = 0;
+	const double n = (double)m_clockSamples.size();
+	for (const auto& s : m_clockSamples) {
+		const double x = s.qpc - x0, y = s.audio - y0;
+		sx += x; sy += y; sxx += x * x; sxy += x * y;
+	}
+	const double den = n * sxx - sx * sx;
+	if (den > 0) {
+		m_audioRate = (n * sxy - sx * sy) / den;
+		m_audioRateSeconds = m_clockSamples.back().qpc - x0;
+	}
+}
+
+bool CAtmosOutput::GetAudioClockRate(double& rate, double& seconds)
+{
+	std::lock_guard<std::mutex> lock(m_clockMutex);
+	if (m_audioRate <= 0.0) {
+		return false;
+	}
+	rate = m_audioRate;
+	seconds = m_audioRateSeconds;
+	return true;
 }
 
 bool CAtmosOutput::PullFrame()
@@ -480,7 +548,7 @@ bool CAtmosOutput::PullFrame()
 	m_nQueuedSamples -= q.f->samples;
 	SetEvent(m_hSpaceEvent);
 
-	// Saut d'horodatage : on recale l'horloge, comme le renderer d'origine.
+	// Timestamp jump: offset the clock, like the original renderer.
 	if (!m_segments.empty()) {
 		const REFERENCE_TIME delta = q.rtStart - m_rtNextQueued;
 		if ((delta > 200 || delta < -200) && OnClockOffset) {
@@ -526,7 +594,7 @@ void CAtmosOutput::RenderPeriod()
 
 	std::unique_lock<std::mutex> lock(m_mutex);
 
-	// Alimente le tampon d'entrée : il faut couvrir la période plus le noyau d'interpolation.
+	// Fill the input buffer: it must cover the period plus the interpolation kernel.
 	const double speed = m_bRunning ? m_dSpeed : 1.0;
 	if (m_bRunning) {
 		const double need = m_pos + frames * speed + KERNEL_HALF + 2;
@@ -534,7 +602,7 @@ void CAtmosOutput::RenderPeriod()
 		}
 	}
 
-	// Découvre la nature des éléments (LFE ou objet) dès que des données sont là.
+	// Find out the element kinds (LFE or object) as soon as data is available.
 	const Segment* pFirst = SegmentAt((uint64_t)m_pos);
 	if (!pFirst && !m_segments.empty()) {
 		pFirst = &m_segments.front();
@@ -555,7 +623,7 @@ void CAtmosOutput::RenderPeriod()
 		}
 	}
 
-	// Tampons de tous les objets actifs, remis à zéro.
+	// Buffers of all active objects, zeroed.
 	float* out[16] = {};
 	for (unsigned c = 0; c < 16; c++) {
 		if (m_pObjects[c]) {
@@ -574,18 +642,18 @@ void CAtmosOutput::RenderPeriod()
 			m_bHaveState = true;
 		}
 
-		// Échantillons produits tant que le noyau reste dans le tampon.
+		// Produce samples while the kernel stays within the buffer.
 		UINT32 i = 0;
 		for (; i < frames; i++) {
 			const double p = m_pos;
 			const int64_t ip = (int64_t)std::floor(p);
 			if (ip + KERNEL_HALF >= (int64_t)m_end) {
-				break; // famine : le reste de la période est silencieux
+				break; // underrun: the rest of the period is silent
 			}
 			const double frac = p - (double)ip;
 			const unsigned phase = (unsigned)(frac * KERNEL_PHASES);
 			if (phase == 0 && frac * KERNEL_PHASES < 1e-9) {
-				// Position entière : copie exacte (aucune altération à vitesse 1).
+				// Integer position: exact copy (bit-exact at speed 1).
 				for (unsigned c = 0; c < 16; c++) {
 					if (out[c]) {
 						out[c][i] = Sample(c, ip);
@@ -614,7 +682,7 @@ void CAtmosOutput::RenderPeriod()
 			m_rtCurrentRendered = s->rtStart + (REFERENCE_TIME)((m_pos - (double)s->start) * UNITS_PER_SEC / SAMPLE_RATE);
 		}
 
-		// Libère l'entrée consommée (en gardant le contexte du noyau).
+		// Drop consumed input (keeping the kernel context).
 		const int64_t keep = (int64_t)std::floor(m_pos) - KERNEL_HALF - 1;
 		if (keep > (int64_t)m_base + 4096) {
 			const size_t drop = (size_t)(keep - (int64_t)m_base);
@@ -628,7 +696,7 @@ void CAtmosOutput::RenderPeriod()
 		}
 	}
 
-	// Positions et gains au début de la période.
+	// Positions and gains at the start of the period.
 	for (unsigned c = 0; c < 16; c++) {
 		if (!m_pObjects[c]) {
 			continue;
@@ -637,8 +705,8 @@ void CAtmosOutput::RenderPeriod()
 		const float gain = (m_bHaveState && e.active) ? e.gain * m_fVolume : 0.0f;
 		m_pObjects[c]->SetVolume(gain);
 		if (m_ObjectKind[c] != KIND_LFE && m_bHaveState) {
-			// DAMF : x gauche/droite, y arrière/avant, z sol/plafond
-			// Windows : x droite, y haut, z vers l'arrière
+			// DAMF: x left/right, y back/front, z floor/ceiling
+			// Windows: x right, y up, z towards the back
 			m_pObjects[c]->SetPosition(e.x, e.z, -e.y);
 		}
 	}

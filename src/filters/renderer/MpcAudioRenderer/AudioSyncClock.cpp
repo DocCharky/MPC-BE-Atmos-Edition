@@ -85,7 +85,7 @@ void CAudioSyncClock::SetSpeed(double speed)
 		return;
 	}
 	if (m_pAudioClock) {
-		// Rebase : le temps deja ecoule reste compte a l'ancienne vitesse.
+		// Rebase: time already elapsed stays counted at the previous speed.
 		UINT64 audioFrequency, audioPosition;
 		if (SUCCEEDED(m_pAudioClock->GetFrequency(&audioFrequency))
 				&& SUCCEEDED(m_pAudioClock->GetPosition(&audioPosition, nullptr))
