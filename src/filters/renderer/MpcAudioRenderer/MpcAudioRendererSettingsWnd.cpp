@@ -99,8 +99,8 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 	p.y += h20;
 	m_cbPauseKeepActive.Create(ResStr(IDS_ARS_PAUSE_KEEP_ACTIVE), dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_PAUSE_KEEP_ACTIVE);
 	p.y += h20;
-	m_cbAtmosObjects.Create(L"TrueHD: decode and output as Atmos objects (Windows Spatial Sound)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_ATMOS_OBJECTS);
-	p.y += h20;
+	m_cbAtmosObjects.Create(L"TrueHD: decode and output as Atmos objects\n(Windows Spatial Sound)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT | BS_MULTILINE, CRect(p, CSize(ScaleX(320), m_fontheight * 2 + 2)), this, IDC_PP_ATMOS_OBJECTS);
+	p.y += h20 + m_fontheight;
 	m_cbVideoSync.Create(L"Sync audio to display refresh (ReClock-style, resamples)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_VIDEO_SYNC);
 	p.y += h20;
 	p.x += ScaleX(240);
