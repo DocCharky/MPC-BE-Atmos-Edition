@@ -46,7 +46,7 @@ jobs:
           .\\update_gcc.bat
         shell: pwsh
 
-      - name: Build thdatmos (TrueHD Atmos decoder)
+      - name: Build thdatmos (TrueHD and E-AC-3 decoder)
         run: |
           rustup update stable
           cargo build --release --manifest-path src/ExtLib/thdatmos/Cargo.toml

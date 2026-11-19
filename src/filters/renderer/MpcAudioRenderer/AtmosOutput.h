@@ -1,10 +1,12 @@
 ﻿/*
  * AtmosOutput — MPC-BE Atmos Edition
  *
- * Decodes TrueHD (Atmos or not) received packed as IEC 61937 / MAT and plays it
+ * Decodes TrueHD (Atmos or not) received packed as IEC 61937 / MAT, and E-AC-3
+ * (Atmos or not) received as IEC 61937, and plays it
  * through Windows Spatial Sound ("Dolby Atmos for home theater"): each element
  * of the track becomes a positioned audio object. TrueHD decoding is done by
- * thdatmos.dll (based on truehdd, Apache 2.0 license).
+ * thdatmos.dll (based on truehdd, Apache 2.0 license); E-AC-3 decoding uses
+ * OpenJOC (Apache 2.0), which renders the Atmos scene to 9.1.6 fixed objects.
  * Also plays PCM with height channels (DTS:X decoded by MPC-BE, 7.1.4 files):
  * each channel becomes an object fixed at its speaker position.
  *
@@ -28,6 +30,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include "SyncTools.h"
@@ -73,6 +76,9 @@ public:
 	REFERENCE_TIME GetCurrentRenderedTime();
 	size_t         QueuedSamples();
 	unsigned       GetDynamicObjectCount() const { return m_nMaxDynamic; }
+	// Decoded stream: bit 0 TrueHD, bit 1 E-AC-3, bit 2 Atmos objects (0 if unknown).
+	uint32_t       GetStreamInfo();
+	std::atomic<uint32_t> m_nStreamInfo{0};
 
 	// Called by the render thread when timestamps jump (like the original renderer).
 	std::function<void(REFERENCE_TIME)> OnClockOffset;
@@ -102,6 +108,11 @@ private:
 
 	bool  WaitForSpace(HANDLE hAbort1, HANDLE hAbort2); // false if aborted
 	void  QueueFrame(std::unique_ptr<Frame>& frame, REFERENCE_TIME rtStart, bool& bDiscontinuity);
+	void  QueueResampled(std::unique_ptr<Frame>& frame, REFERENCE_TIME rtStart, bool& bDiscontinuity);
+	// Sample rate conversion to 48 kHz (tracks at other rates)
+	CVarResampler      m_rateRs;
+	uint32_t           m_rateRsRate = 0;
+	std::vector<float> m_rateIn, m_rateOut;
 	static DWORD WINAPI ThreadProc(LPVOID p) { return static_cast<CAtmosOutput*>(p)->RenderThread(); }
 	DWORD RenderThread();
 	void  RenderPeriod();

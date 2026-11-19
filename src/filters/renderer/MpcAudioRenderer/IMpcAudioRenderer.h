@@ -43,7 +43,7 @@ enum WASAPI_METHOD {
 	PUSH
 };
 
-interface __declspec(uuid("B975D0A6-31A4-470A-9F8E-EC651380D1E3"))
+interface __declspec(uuid("6790EEA4-1283-4D3C-857E-184168103B6C"))
 IMpcAudioRendererFilter :
 public IUnknown {
 	STDMETHOD(Apply()) PURE;
@@ -83,4 +83,6 @@ public IUnknown {
 	STDMETHOD(GetAtmosStatus(CString& output, CString& sync)) PURE;
 	STDMETHOD(SetHeightObjects(BOOL bValue)) PURE;
 	STDMETHOD_(BOOL, GetHeightObjects()) PURE;
+	STDMETHOD(SetEac3Objects(BOOL bValue)) PURE;
+	STDMETHOD_(BOOL, GetEac3Objects()) PURE;
 };

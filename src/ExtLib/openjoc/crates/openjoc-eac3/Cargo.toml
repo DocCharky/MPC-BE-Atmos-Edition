@@ -1,0 +1,23 @@
+[package]
+name = "openjoc-eac3"
+version.workspace = true
+description = "Research-grade E-AC-3 syntax and base-audio decoding for OpenJOC"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+allocation-profile = []
+
+[dependencies]
+openjoc-bitio = { version = "0.20.2", path = "../openjoc-bitio" }
+openjoc-emdf = { version = "0.20.2", path = "../openjoc-emdf" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"
+
+[lints]
+workspace = true

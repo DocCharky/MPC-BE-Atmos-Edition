@@ -23,6 +23,7 @@ namespace
 	typedef int   (*PFN_thd_push_iec61937)(void*, const uint8_t*, size_t);
 	typedef int   (*PFN_thd_pull)(void*, CAtmosOutput::Frame*);
 	typedef void  (*PFN_thd_close)(void*);
+	typedef uint32_t (*PFN_thd_info)(const void*);
 
 	static int s_moduleAnchor = 0;
 
@@ -34,6 +35,7 @@ namespace
 		PFN_thd_push_iec61937 push = nullptr;
 		PFN_thd_pull          pull = nullptr;
 		PFN_thd_close         close = nullptr;
+		PFN_thd_info          info = nullptr; // optional
 
 		bool Load() {
 			if (tried) {
@@ -59,6 +61,7 @@ namespace
 			push   = (PFN_thd_push_iec61937)GetProcAddress(hLib, "thd_push_iec61937");
 			pull   = (PFN_thd_pull)GetProcAddress(hLib, "thd_pull");
 			close  = (PFN_thd_close)GetProcAddress(hLib, "thd_close");
+			info   = (PFN_thd_info)GetProcAddress(hLib, "thd_info");
 			if (!create || !reset || !push || !pull || !close) {
 				AtmosLog(L"thdatmos.dll: missing exports");
 				FreeLibrary(hLib);
@@ -277,17 +280,23 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 		return S_FALSE; // not packed TrueHD
 	}
 
+	if (g_thd.info) {
+		m_nStreamInfo = g_thd.info(m_pDecoder); // read on this thread only (the decoder is not shared)
+	}
+
 	auto frame = std::make_unique<Frame>();
 	while (g_thd.pull(m_pDecoder, frame.get()) == 1) {
 		if (!frame->samples) {
 			continue;
 		}
 		if (frame->sample_rate != SAMPLE_RATE) {
-			// The spatial stream runs at 48 kHz: 96/192 kHz are averaged down (rare non-Atmos tracks).
-			const uint32_t f = frame->sample_rate / SAMPLE_RATE;
-			if (f < 2 || frame->sample_rate % SAMPLE_RATE) {
-				continue; // 44.1 kHz family: not supported
+			if (!frame->sample_rate || frame->sample_rate > 8 * SAMPLE_RATE) {
+				continue;
 			}
+			// The spatial stream runs at 48 kHz (rare tracks at other rates). First an integer
+			// decimation by averaging (96 -> 48, 88.2 -> 44.1 kHz...), then, unless already
+			// at 48 kHz, sinc resampling up to 48 kHz.
+			const uint32_t f = (frame->sample_rate + SAMPLE_RATE - 1) / SAMPLE_RATE;
 			const uint32_t n = frame->samples / f;
 			for (uint32_t s = 0; s < n; s++) {
 				for (uint32_t c = 0; c < frame->channels && c < 16; c++) {
@@ -299,8 +308,12 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 				}
 			}
 			frame->samples = n;
-			frame->sample_rate = SAMPLE_RATE;
+			frame->sample_rate /= f;
 			if (!n) {
+				continue;
+			}
+			if (frame->sample_rate != SAMPLE_RATE) {
+				QueueResampled(frame, rtStart, bDiscontinuity);
 				continue;
 			}
 		}
@@ -308,6 +321,45 @@ HRESULT CAtmosOutput::Receive(const BYTE* pData, long size, REFERENCE_TIME rtSta
 	}
 
 	return S_OK;
+}
+
+void CAtmosOutput::QueueResampled(std::unique_ptr<Frame>& frame, REFERENCE_TIME rtStart, bool& bDiscontinuity)
+{
+	const uint32_t ch = std::min<uint32_t>(frame->channels, 16);
+	if (!ch) {
+		return;
+	}
+	if (bDiscontinuity || frame->sample_rate != m_rateRsRate || ch != m_rateRs.Channels()) {
+		m_rateRs.Reset(ch);
+		m_rateRsRate = frame->sample_rate;
+	}
+	m_rateIn.resize((size_t)frame->samples * ch);
+	for (uint32_t s = 0; s < frame->samples; s++) {
+		for (uint32_t c = 0; c < ch; c++) {
+			m_rateIn[(size_t)s * ch + c] = frame->pcm[s][c];
+		}
+	}
+	double firstPos = 0.0;
+	const size_t n = m_rateRs.Process(m_rateIn.data(), frame->samples, (double)frame->sample_rate / SAMPLE_RATE, m_rateOut, firstPos);
+	Element elements[16];
+	memcpy(elements, frame->elements, sizeof(elements));
+	size_t done = 0;
+	while (done < n) {
+		auto out = std::make_unique<Frame>();
+		const uint32_t k = (uint32_t)std::min<size_t>(n - done, 160);
+		out->sample_pos  = 0;
+		out->samples     = k;
+		out->channels    = ch;
+		out->sample_rate = SAMPLE_RATE;
+		memcpy(out->elements, elements, sizeof(elements));
+		for (uint32_t s = 0; s < k; s++) {
+			for (uint32_t c = 0; c < ch; c++) {
+				out->pcm[s][c] = m_rateOut[(done + s) * ch + c];
+			}
+		}
+		QueueFrame(out, rtStart, bDiscontinuity);
+		done += k;
+	}
 }
 
 bool CAtmosOutput::WaitForSpace(HANDLE hAbort1, HANDLE hAbort2)
@@ -434,10 +486,16 @@ void CAtmosOutput::Flush()
 	ResetBuffers();
 	m_rtNextDecoded = INVALID_TIME_VALUE;
 	m_rtCurrentRendered = 0;
+	m_rateRsRate = 0; // resampler restarts with the next frame
 	if (m_pDecoder) {
 		g_thd.reset(m_pDecoder);
 	}
 	SetEvent(m_hSpaceEvent);
+}
+
+uint32_t CAtmosOutput::GetStreamInfo()
+{
+	return m_nStreamInfo.load();
 }
 
 void CAtmosOutput::SetRunning(bool bRunning)

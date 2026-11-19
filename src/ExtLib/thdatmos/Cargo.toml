@@ -3,7 +3,7 @@ name = "thdatmos"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Real-time TrueHD Atmos decoding for MPC-BE Atmos Edition (based on truehdd)"
+description = "Real-time TrueHD and E-AC-3 Atmos decoding for MPC-BE Atmos Edition (based on truehdd and OpenJOC)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -12,6 +12,8 @@ crate-type = ["cdylib", "rlib"]
 truehd = { git = "https://github.com/truehdd/truehdd", rev = "d14ceb35f68074eeb3e52beb5d2a10314b2e2adb" }
 matroska-demuxer = "0.7"
 log = "0.4"
+openjoc-api = { path = "../openjoc/crates/openjoc-api", default-features = false }
+openjoc-eac3 = { path = "../openjoc/crates/openjoc-eac3" }
 
 [profile.release]
 opt-level = 3

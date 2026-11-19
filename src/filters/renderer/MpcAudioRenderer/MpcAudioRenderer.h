@@ -89,6 +89,9 @@ class __declspec(uuid("601D2A2B-9CDE-40bd-8650-0485E3522727"))
 	BOOL              m_bAtmosObjects = TRUE; // option: TrueHD -> Atmos objects
 	BOOL              m_bVideoSync = TRUE;    // option: ReClock-style display sync
 	BOOL              m_bHeightObjects = TRUE; // option: PCM with height channels -> objects
+	BOOL              m_bEac3Objects = TRUE;  // option: E-AC-3 (DD+, DD+ Atmos) -> objects
+	bool              IsEac3Bitstream(const WAVEFORMATEX* pwfx) const;
+	bool              IsObjectBitstream(const WAVEFORMATEX* pwfx) const;
 	bool              m_bSpatialPcm = false;  // spatial output fed with PCM (not TrueHD)
 	bool              IsHeightPcm(const WAVEFORMATEX* pwf) const;
 	bool              SpatialAvailable();
@@ -233,6 +236,8 @@ public:
 	STDMETHODIMP_(BOOL)           GetVideoSync() override;
 	STDMETHODIMP                  SetHeightObjects(BOOL bValue) override;
 	STDMETHODIMP_(BOOL)           GetHeightObjects() override;
+	STDMETHODIMP                  SetEac3Objects(BOOL bValue) override;
+	STDMETHODIMP_(BOOL)           GetEac3Objects() override;
 	STDMETHODIMP                  GetAtmosStatus(CString& output, CString& sync) override;
 
 	// CMpcAudioRenderer

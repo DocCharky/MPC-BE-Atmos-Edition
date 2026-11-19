@@ -101,6 +101,8 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 	p.y += h20;
 	m_cbAtmosObjects.Create(L"TrueHD: decode and output as Atmos objects\n(Windows Spatial Sound)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT | BS_MULTILINE, CRect(p, CSize(ScaleX(320), m_fontheight * 2 + 2)), this, IDC_PP_ATMOS_OBJECTS);
 	p.y += h20 + m_fontheight;
+	m_cbEac3Objects.Create(L"E-AC-3 (DD+, DD+ Atmos): decode and output as objects\n(Windows Spatial Sound)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT | BS_MULTILINE, CRect(p, CSize(ScaleX(320), m_fontheight * 2 + 2)), this, IDC_PP_EAC3_OBJECTS);
+	p.y += h20 + m_fontheight;
 	m_cbHeightObjects.Create(L"DTS:X / PCM with height channels: output as objects\n(Windows Spatial Sound)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT | BS_MULTILINE, CRect(p, CSize(ScaleX(320), m_fontheight * 2 + 2)), this, IDC_PP_HEIGHT_OBJECTS);
 	p.y += h20 + m_fontheight;
 	m_cbVideoSync.Create(L"Sync audio to display refresh (ReClock-style, resamples)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_VIDEO_SYNC);
@@ -151,6 +153,7 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 		m_cbAtmosObjects.SetCheck(m_pMAR->GetAtmosObjects());
 		m_cbVideoSync.SetCheck(m_pMAR->GetVideoSync());
 		m_cbHeightObjects.SetCheck(m_pMAR->GetHeightObjects());
+		m_cbEac3Objects.SetCheck(m_pMAR->GetEac3Objects());
 	}
 
 	for (CWnd* pWnd = GetWindow(GW_CHILD); pWnd; pWnd = pWnd->GetNextWindow()) {
@@ -194,6 +197,7 @@ bool CMpcAudioRendererSettingsWnd::OnApply()
 		m_pMAR->SetAtmosObjects(m_cbAtmosObjects.GetCheck());
 		m_pMAR->SetVideoSync(m_cbVideoSync.GetCheck());
 		m_pMAR->SetHeightObjects(m_cbHeightObjects.GetCheck());
+		m_pMAR->SetEac3Objects(m_cbEac3Objects.GetCheck());
 		int idx = m_cbSoundDevice.GetCurSel();
 		if (idx >= 0) {
 			m_pMAR->SetDeviceId(m_deviceList[idx].deviceId, m_deviceList[idx].deviceName);
@@ -253,6 +257,7 @@ void CMpcAudioRendererSettingsWnd::OnBnClickedReset()
 	m_cbAtmosObjects.SetCheck(BST_CHECKED);
 	m_cbVideoSync.SetCheck(BST_CHECKED);
 	m_cbHeightObjects.SetCheck(BST_CHECKED);
+	m_cbEac3Objects.SetCheck(BST_CHECKED);
 
 	OnClickedWasapiMode();
 
@@ -360,11 +365,12 @@ void CMpcAudioRendererStatusWnd::UpdateStatus()
 		m_edtMode.SetWindowTextW(modeStr);
 		m_edtSync.SetWindowTextW(atmosSync);
 
-		const bool bSpatialPcm = !atmosOut.IsEmpty() && atmosOut.Find(L"TrueHD") < 0;
+		const bool bSpatialPcm = atmosOut.Find(L"PCM") >= 0;
 		if (!atmosOut.IsEmpty() && !bSpatialPcm) {
-			m_InputFormatText.SetWindowTextW(L"TrueHD (bitstream)");
+			const bool bEac3 = atmosOut.Find(L"E-AC-3") >= 0;
+			m_InputFormatText.SetWindowTextW(bEac3 ? L"E-AC-3 (bitstream)" : L"TrueHD (bitstream)");
 			m_InputRateText.SetWindowTextW(L"48000");
-			m_InputChannelText.SetWindowTextW(L"Atmos / 16 max");
+			m_InputChannelText.SetWindowTextW(atmosOut.Find(L"Atmos") >= 0 ? L"Atmos" : L"Channels");
 			m_OutputFormatText.SetWindowTextW(L"32-bit Float");
 			m_OutputRateText.SetWindowTextW(L"48000");
 			m_OutputChannelText.SetWindowTextW(L"Spatial objects");

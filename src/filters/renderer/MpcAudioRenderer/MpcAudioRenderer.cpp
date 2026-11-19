@@ -51,6 +51,7 @@
 #define OPT_AtmosObjects            L"AtmosObjects"
 #define OPT_VideoSync               L"VideoSync"
 #define OPT_HeightObjects           L"HeightObjects"
+#define OPT_Eac3Objects             L"Eac3Objects"
 // TODO: rename option values
 
 // set to 1(or more) to enable more detail debug log
@@ -280,6 +281,9 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HeightObjects, dw)) {
 			m_bHeightObjects = !!dw;
 		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_Eac3Objects, dw)) {
+			m_bEac3Objects = !!dw;
+		}
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -298,6 +302,7 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_AtmosObjects, m_bAtmosObjects);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_VideoSync, m_bVideoSync);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_HeightObjects, m_bHeightObjects);
+	profile.ReadInt(OPT_SECTION_AudRend, OPT_Eac3Objects, m_bEac3Objects);
 #endif
 
 	if (m_DeviceMode != MODE_WASAPI_EXCLUSIVE) {
@@ -467,12 +472,13 @@ HRESULT	CMpcAudioRenderer::CheckMediaType(const CMediaType *pmt)
 		// Check S/PDIF & HDMI Bitstream
 		const WAVEFORMATEX *pWaveFormatEx = (WAVEFORMATEX*)pmt->pbFormat;
 		const BOOL bIsBitstreamInput = IsBitstream(pWaveFormatEx);
-		if (bIsBitstreamInput && IsTrueHDBitstream(pWaveFormatEx)) {
+		if (bIsBitstreamInput && IsObjectBitstream(pWaveFormatEx)) {
+			const wchar_t* codec = IsEac3Bitstream(pWaveFormatEx) ? L"E-AC-3" : L"TrueHD";
 			if (AtmosSupported()) {
-				AtmosLog(L"CheckMediaType: TrueHD accepted for Atmos output");
+				AtmosLog(L"CheckMediaType: %s accepted for spatial output", codec);
 				return S_OK;
 			}
-			AtmosLog(L"CheckMediaType: TrueHD offered, Atmos output unavailable -> bitstream check");
+			AtmosLog(L"CheckMediaType: %s offered, spatial output unavailable -> bitstream check", codec);
 		}
 		if (bIsBitstreamInput) {
 			hr = CreateAudioClient();
@@ -590,8 +596,8 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 	HRESULT hr = S_OK;
 
 	AtmosLog(L"SetMediaType: format 0x%04x, %u channels, %u Hz%s", pwf->wFormatTag, pwf->nChannels, pwf->nSamplesPerSec,
-			 IsTrueHDBitstream(pwf) ? L" (TrueHD IEC 61937)" : L"");
-	const bool bTrueHD = IsTrueHDBitstream(pwf) && AtmosSupported();
+			 IsTrueHDBitstream(pwf) ? L" (TrueHD IEC 61937)" : IsEac3Bitstream(pwf) ? L" (E-AC-3 IEC 61937)" : L"");
+	const bool bTrueHD = IsObjectBitstream(pwf) && AtmosSupported(); // TrueHD or E-AC-3, decoded by thdatmos
 	const bool bHeights = !bTrueHD && IsHeightPcm(pwf);
 	if (bTrueHD || (bHeights && SpatialAvailable())) {
 		// Atmos Edition: release the WASAPI output (the spatial stream goes through the shared engine)
@@ -612,7 +618,8 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 		hr = m_Atmos.Open(m_pMMDevice);
 		if (SUCCEEDED(hr)) {
 			if (bTrueHD) {
-				AtmosLog(L"SetMediaType: TrueHD -> Atmos objects (%u dynamic objects)", m_Atmos.GetDynamicObjectCount());
+				AtmosLog(L"SetMediaType: %s -> objects (%u dynamic objects)", IsEac3Bitstream(pwf) ? L"E-AC-3" : L"TrueHD",
+						 m_Atmos.GetDynamicObjectCount());
 			} else {
 				AtmosLog(L"SetMediaType: PCM with height channels (%u channels, mask 0x%x) -> objects", pwf->nChannels,
 						 ((const WAVEFORMATEXTENSIBLE*)pwf)->dwChannelMask);
@@ -621,7 +628,7 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 			m_bSpatialPcm = bHeights;
 			m_Atmos.SetVolume((float)m_dVolumeFactor);
 			CopyWaveFormat(pwf, &m_pWaveFormatExInput);
-			m_BitstreamMode = bTrueHD ? BITSTREAM_TRUEHD : BITSTREAM_NONE;
+			m_BitstreamMode = !bTrueHD ? BITSTREAM_NONE : IsEac3Bitstream(pwf) ? BITSTREAM_EAC3 : BITSTREAM_TRUEHD;
 			if (m_filterState == State_Running) {
 				// Format change during playback (e.g. DTS:X heights appearing): Run() will not be called again.
 				AtmosLog(L"SetMediaType: switching to spatial output during playback");
@@ -1269,6 +1276,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 		key.SetDWORDValue(OPT_AtmosObjects, m_bAtmosObjects);
 		key.SetDWORDValue(OPT_VideoSync, m_bVideoSync);
 		key.SetDWORDValue(OPT_HeightObjects, m_bHeightObjects);
+		key.SetDWORDValue(OPT_Eac3Objects, m_bEac3Objects);
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -1287,6 +1295,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_AtmosObjects, m_bAtmosObjects);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_VideoSync, m_bVideoSync);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_HeightObjects, m_bHeightObjects);
+	profile.WriteInt(OPT_SECTION_AudRend, OPT_Eac3Objects, m_bEac3Objects);
 #endif
 
 	return S_OK;
@@ -3745,7 +3754,16 @@ STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
 		output.Format(L"Windows Spatial Sound, PCM with heights \u2192 fixed objects (%u channels)",
 					  m_pWaveFormatExInput ? m_pWaveFormatExInput->nChannels : 0);
 	} else if (m_bAtmos) {
-		output.Format(L"Windows Spatial Sound, TrueHD \u2192 objects (%u dynamic max)", m_Atmos.GetDynamicObjectCount());
+		const uint32_t info = m_Atmos.GetStreamInfo();
+		const bool bAtmosStream = !!(info & 4);
+		if (m_BitstreamMode == BITSTREAM_EAC3) {
+			output = bAtmosStream ? L"Windows Spatial Sound, E-AC-3 Atmos \u2192 9.1.6 fixed objects"
+								  : L"Windows Spatial Sound, E-AC-3 \u2192 fixed objects";
+		} else if (info && !bAtmosStream) {
+			output = L"Windows Spatial Sound, TrueHD \u2192 fixed objects";
+		} else {
+			output.Format(L"Windows Spatial Sound, TrueHD Atmos \u2192 objects (%u dynamic max)", m_Atmos.GetDynamicObjectCount());
+		}
 	}
 
 	double hz = 0.0, secs = 0.0, audioRate = 0.0, audioSecs = 0.0;
@@ -3875,12 +3893,24 @@ void CMpcAudioRenderer::UpdateSyncSpeed()
 	}
 }
 
+bool CMpcAudioRenderer::IsEac3Bitstream(const WAVEFORMATEX* pwfx) const
+{
+	if (pwfx && IsWaveFormatExtensible(pwfx)) {
+		const WAVEFORMATEXTENSIBLE* wfex = (const WAVEFORMATEXTENSIBLE*)pwfx;
+		return wfex->SubFormat == KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS;
+	}
+	return false;
+}
+
+// Bitstream decoded by the renderer itself (thdatmos), according to the options.
+bool CMpcAudioRenderer::IsObjectBitstream(const WAVEFORMATEX* pwfx) const
+{
+	return (IsTrueHDBitstream(pwfx) && m_bAtmosObjects) || (IsEac3Bitstream(pwfx) && m_bEac3Objects);
+}
+
+// thdatmos.dll present and a spatial sound format active.
 bool CMpcAudioRenderer::AtmosSupported()
 {
-	if (!m_bAtmosObjects) {
-		AtmosLog(L"AtmosSupported: option disabled");
-		return false;
-	}
 	if (!CAtmosOutput::LibraryAvailable()) {
 		AtmosLog(L"AtmosSupported: thdatmos.dll not loaded");
 		return false;
@@ -3982,6 +4012,19 @@ HRESULT CMpcAudioRenderer::TransformSpatialPcm(IMediaSample* pMediaSample)
 	m_rtLastReceivedSampleTimeEnd = (rtStart == INVALID_TIME ? m_rtLastReceivedSampleTimeEnd : rtStart)
 								  + llMulDiv(samples, UNITS, pwf->nSamplesPerSec, 0);
 	return hr;
+}
+
+STDMETHODIMP CMpcAudioRenderer::SetEac3Objects(BOOL bValue)
+{
+	CAutoLock cAutoLock(&m_csProps);
+	m_bEac3Objects = bValue;
+	return S_OK;
+}
+
+STDMETHODIMP_(BOOL) CMpcAudioRenderer::GetEac3Objects()
+{
+	CAutoLock cAutoLock(&m_csProps);
+	return m_bEac3Objects;
 }
 
 STDMETHODIMP CMpcAudioRenderer::SetHeightObjects(BOOL bValue)

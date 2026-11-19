@@ -1,0 +1,39 @@
+diff --git a/crates/openjoc-api/src/lib.rs b/crates/openjoc-api/src/lib.rs
+index 54de5bc..a843673 100644
+--- a/crates/openjoc-api/src/lib.rs
++++ b/crates/openjoc-api/src/lib.rs
+@@ -894,10 +894,20 @@ impl OpenJocSession {
+     }
+ }
+ 
++/// Atmos Edition: default home-theatre reference screen (whole front wall, listener level).
++pub(crate) fn default_reference_screen() -> openjoc_oamd::ReferenceScreen {
++    openjoc_oamd::ReferenceScreen {
++        bottom_left: openjoc_oamd::Position3 { x: 0.0, y: 0.0, z: 0.0 },
++        width: 1.0,
++        height: 0.0,
++    }
++}
++
+ fn new_payload_decoder(config: &OpenJocConfig) -> PayloadDecoder {
+     PayloadDecoder::streaming_with_oamd_profile(
+         PayloadDecoderConfig {
+-            reference_screen: None,
++            // Atmos Edition: default home-theatre screen (front wall, listener level)
++            reference_screen: Some(default_reference_screen()),
+             oamd: config.oamd,
+         },
+         OamdParseProfile::EtsiStrict,
+diff --git a/crates/openjoc-api/src/speaker.rs b/crates/openjoc-api/src/speaker.rs
+index 6253694..58cd7fc 100644
+--- a/crates/openjoc-api/src/speaker.rs
++++ b/crates/openjoc-api/src/speaker.rs
+@@ -209,7 +209,7 @@ impl SpeakerRenderer {
+         let assembly_start = super::decode_timing::start(self.render_timing.enabled);
+         let control = self
+             .assembler
+-            .assemble_frame(&calibrated_frame, base_coordinates, None)?;
++            .assemble_frame(&calibrated_frame, base_coordinates, Some(crate::default_reference_screen()))?;
+         #[cfg(not(target_arch = "wasm32"))]
+         if let Some(elapsed) = super::decode_timing::finish(assembly_start) {
+             self.render_timing.bridge_control_assembly = self

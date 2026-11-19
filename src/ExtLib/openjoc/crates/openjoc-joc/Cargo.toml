@@ -1,0 +1,17 @@
+[package]
+name = "openjoc-joc"
+version.workspace = true
+description = "ETSI JOC payload parsing and reconstruction-basis decoding"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+num-complex = "0.4"
+openjoc-bitio = { version = "0.20.2", path = "../openjoc-bitio" }
+openjoc-qmf = { version = "0.20.2", path = "../openjoc-qmf" }
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

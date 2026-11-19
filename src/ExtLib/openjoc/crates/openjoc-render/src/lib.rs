@@ -1,0 +1,6552 @@
+//! Explicit-scene speaker rendering for OpenJOC.
+//!
+//! This crate deliberately accepts only caller-supplied [`ExplicitSpatialSource`]
+//! values. It has no dependency on the decoder or metadata scene crates, so a
+//! `ReconstructionBasis` row cannot be silently promoted to an authored object
+//! source while [`SemanticBindingState`](https://docs.rs/openjoc-scene) remains
+//! unresolved.
+//!
+//! J5R1 implements a front-horizontal, equal-power FL/FR panner. J5R2 adds a
+//! separate explicit-scene two-dimensional speaker-layout renderer using
+//! checked public VBAP-style pair mathematics. J5R3 adds sample-accurate,
+//! absolute-timeline azimuth and gain trajectories on top of both renderers.
+//! J5R4 adds explicit caller-declared three-dimensional speaker topology and
+//! checked 3x3 VBAP triplet gains. J5R5 adds sample-accurate three-dimensional
+//! great-circle trajectories over that immutable topology. J5R6 adds a static,
+//! caller-supplied exact-direction HRIR provider and direct causal binaural
+//! FIR stream with explicit history and tail draining. J5R7 adds an additive
+//! fixed-uniform FFT partitioned backend with explicit input-partition,
+//! latency, final-partial-input, and tail contracts; Direct FIR remains the
+//! reference implementation. SOFA ingestion and deterministic interpolation
+//! live at the `openjoc-sofa` boundary; moving binaural sources, distance, room
+//! acoustics, occlusion, and JOC semantic binding remain explicit non-features.
+
+// pattern: Functional Core
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
+
+mod direct_fir;
+mod dynamic_binaural;
+mod final_linked_gain;
+mod partitioned;
+mod prepared_binaural;
+mod sample_delay;
+
+pub use sample_delay::SampleDelay;
+
+pub use dynamic_binaural::{
+    AppliedBinauralUpdate, BinauralResetFailure, BinauralUpdateAcceptance,
+    BinauralUpdateApplyFailure, DEFAULT_DYNAMIC_BINAURAL_TRANSITION_SAMPLES,
+    DynamicBinauralRenderer, DynamicBinauralSource, MAX_DYNAMIC_BINAURAL_BLOCK_SAMPLES,
+    MAX_DYNAMIC_BINAURAL_HRIR_TAPS, MAX_DYNAMIC_BINAURAL_SOURCES,
+};
+pub use final_linked_gain::{
+    FINAL_LINKED_GAIN_BLOCK_SAMPLES, FinalLinkedGain, FinalLinkedGainAvailability,
+    FinalLinkedGainError, final_linked_gain_availability,
+};
+pub use partitioned::{
+    PartitionedBinauralRenderer, UniformPartitionedConfig, UniformPartitionedConvolver,
+};
+pub use prepared_binaural::{
+    BinauralResourceIdentity, PreparedBinauralKernel, PreparedBinauralUpdate,
+};
+
+/// The fixed output channel order for the J5R1 speaker renderer.
+pub const STEREO_CHANNEL_ORDER: [&str; 2] = ["FL", "FR"];
+
+/// An opaque caller-provided identity for one explicit spatial source.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SourceId(u64);
+
+impl SourceId {
+    /// Creates an opaque source identity from a caller-owned value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the caller-owned identity value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Cartesian position relative to the listener.
+///
+/// The initial renderer uses `x` and `y` for front-horizontal azimuth only:
+/// `+X` is right, `-X` is left, `+Y` is front, `-Y` is rear, and `+Z` is up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CartesianPosition {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl CartesianPosition {
+    /// Creates a Cartesian position without silently normalizing or clamping it.
+    #[must_use]
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+}
+
+/// One borrowed mono PCM block with explicit caller-supplied spatial semantics.
+#[derive(Clone, Copy, Debug)]
+pub struct ExplicitSpatialSource<'a> {
+    id: SourceId,
+    samples: &'a [f64],
+    position: CartesianPosition,
+    gain: f64,
+}
+
+impl<'a> ExplicitSpatialSource<'a> {
+    /// Creates a source after validating its position, gain, and PCM block.
+    ///
+    /// The samples are borrowed; the renderer does not retain or copy them.
+    pub fn new(
+        id: SourceId,
+        samples: &'a [f64],
+        position: CartesianPosition,
+        gain: f64,
+    ) -> Result<Self, RenderError> {
+        validate_position(position)?;
+        validate_gain(gain)?;
+        if let Some(sample_index) = samples.iter().position(|sample| !sample.is_finite()) {
+            return Err(RenderError::NonFiniteSourceSample { id, sample_index });
+        }
+        Ok(Self {
+            id,
+            samples,
+            position,
+            gain,
+        })
+    }
+
+    /// Returns the opaque caller-provided source identity.
+    #[must_use]
+    pub const fn id(self) -> SourceId {
+        self.id
+    }
+
+    /// Returns the borrowed mono PCM block.
+    #[must_use]
+    pub const fn samples(self) -> &'a [f64] {
+        self.samples
+    }
+
+    /// Returns the explicit Cartesian position.
+    #[must_use]
+    pub const fn position(self) -> CartesianPosition {
+        self.position
+    }
+
+    /// Returns the explicit linear source gain.
+    #[must_use]
+    pub const fn gain(self) -> f64 {
+        self.gain
+    }
+}
+
+/// A borrowed explicit scene composed of caller-supplied source blocks.
+#[derive(Clone, Copy, Debug)]
+pub struct ExplicitSpatialScene<'a> {
+    sample_rate_hz: u32,
+    sources: &'a [ExplicitSpatialSource<'a>],
+}
+
+impl<'a> ExplicitSpatialScene<'a> {
+    /// Creates a scene with an explicit sample rate and source identity set.
+    pub fn new(
+        sample_rate_hz: u32,
+        sources: &'a [ExplicitSpatialSource<'a>],
+    ) -> Result<Self, RenderError> {
+        if sample_rate_hz == 0 {
+            return Err(RenderError::InvalidSampleRate);
+        }
+        for (index, source) in sources.iter().enumerate() {
+            if sources[index + 1..]
+                .iter()
+                .any(|other| other.id == source.id)
+            {
+                return Err(RenderError::DuplicateSourceId { id: source.id });
+            }
+        }
+        Ok(Self {
+            sample_rate_hz,
+            sources,
+        })
+    }
+
+    /// Returns the scene sample rate.
+    #[must_use]
+    pub const fn sample_rate_hz(self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    /// Returns the borrowed explicit source blocks.
+    #[must_use]
+    pub const fn sources(self) -> &'a [ExplicitSpatialSource<'a>] {
+        self.sources
+    }
+}
+
+/// Equal-power gains for the fixed FL/FR output order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StereoGains {
+    pub left: f64,
+    pub right: f64,
+}
+
+/// A validated spatial state used by a sample-accurate two-dimensional
+/// trajectory.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpatialState2d {
+    position: CartesianPosition,
+    gain: f64,
+}
+
+impl SpatialState2d {
+    /// Creates a finite directional state with a finite linear gain.
+    pub fn new(position: CartesianPosition, gain: f64) -> Result<Self, RenderError> {
+        validate_position(position)?;
+        validate_gain(gain)?;
+        if horizontal_magnitude_squared(position) <= 0.0 {
+            return Err(RenderError::UndefinedHorizontalDirection);
+        }
+        Ok(Self { position, gain })
+    }
+
+    /// Returns the Cartesian state position.
+    #[must_use]
+    pub const fn position(self) -> CartesianPosition {
+        self.position
+    }
+
+    /// Returns the finite linear source gain.
+    #[must_use]
+    pub const fn gain(self) -> f64 {
+        self.gain
+    }
+}
+
+/// Explicit horizontal azimuth path selection between trajectory keyframes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AzimuthPath2d {
+    /// Select the shortest signed angular path; exact antipodes are rejected.
+    Shortest,
+    /// Select the non-negative wrapped path.
+    Increasing,
+    /// Select the non-positive wrapped path.
+    Decreasing,
+}
+
+/// One inclusive, linearly interpolated sample-timeline trajectory segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrajectorySegment2d {
+    start_sample: u64,
+    end_sample: u64,
+    start_state: SpatialState2d,
+    end_state: SpatialState2d,
+    azimuth_path: AzimuthPath2d,
+}
+
+impl TrajectorySegment2d {
+    /// Creates a segment whose endpoint samples are both included.
+    pub fn new(
+        start_sample: u64,
+        end_sample: u64,
+        start_state: SpatialState2d,
+        end_state: SpatialState2d,
+        azimuth_path: AzimuthPath2d,
+    ) -> Result<Self, RenderError> {
+        if end_sample <= start_sample {
+            return Err(RenderError::InvalidTrajectorySegment {
+                start_sample,
+                end_sample,
+            });
+        }
+        let span = end_sample - start_sample;
+        if span > MAX_EXACT_INTERPOLATION_SPAN {
+            return Err(RenderError::TrajectorySpanTooLarge { span });
+        }
+        let start_angle = azimuth(start_state.position)?;
+        let end_angle = azimuth(end_state.position)?;
+        let delta = azimuth_delta(start_angle, end_angle, azimuth_path)?;
+        if !delta.is_finite() {
+            return Err(RenderError::InvalidAzimuthPath);
+        }
+        Ok(Self {
+            start_sample,
+            end_sample,
+            start_state,
+            end_state,
+            azimuth_path,
+        })
+    }
+
+    /// Returns the inclusive first sample index.
+    #[must_use]
+    pub const fn start_sample(self) -> u64 {
+        self.start_sample
+    }
+
+    /// Returns the inclusive final sample index.
+    #[must_use]
+    pub const fn end_sample(self) -> u64 {
+        self.end_sample
+    }
+
+    /// Returns the exact start state.
+    #[must_use]
+    pub const fn start_state(self) -> SpatialState2d {
+        self.start_state
+    }
+
+    /// Returns the exact end state.
+    #[must_use]
+    pub const fn end_state(self) -> SpatialState2d {
+        self.end_state
+    }
+
+    /// Returns the explicit azimuth path policy.
+    #[must_use]
+    pub const fn azimuth_path(self) -> AzimuthPath2d {
+        self.azimuth_path
+    }
+
+    fn evaluate(self, sample: u64) -> Result<SpatialState2d, RenderError> {
+        if sample < self.start_sample || sample > self.end_sample {
+            return Err(RenderError::TrajectorySampleOutOfRange { sample });
+        }
+        if sample == self.start_sample {
+            return Ok(self.start_state);
+        }
+        if sample == self.end_sample {
+            return Ok(self.end_state);
+        }
+        if self.start_state == self.end_state {
+            return Ok(self.start_state);
+        }
+        let span = self.end_sample - self.start_sample;
+        let offset = sample - self.start_sample;
+        let t = offset as f64 / span as f64;
+        let start_angle = azimuth(self.start_state.position)?;
+        let delta = azimuth_delta(
+            start_angle,
+            azimuth(self.end_state.position)?,
+            self.azimuth_path,
+        )?;
+        let angle = normalize_azimuth(start_angle + t * delta);
+        let z = self
+            .start_state
+            .position
+            .z
+            .mul_add(1.0 - t, self.end_state.position.z * t);
+        let gain = self
+            .start_state
+            .gain
+            .mul_add(1.0 - t, self.end_state.gain * t);
+        SpatialState2d::new(CartesianPosition::new(angle.sin(), angle.cos(), z), gain)
+    }
+}
+
+/// A contiguous, validated piecewise-linear source trajectory.
+#[derive(Clone, Debug)]
+pub struct SourceTrajectory2d {
+    segments: Vec<TrajectorySegment2d>,
+}
+
+impl SourceTrajectory2d {
+    /// Creates a non-empty contiguous trajectory.
+    pub fn new(segments: Vec<TrajectorySegment2d>) -> Result<Self, RenderError> {
+        segments
+            .first()
+            .copied()
+            .ok_or(RenderError::EmptyTrajectory)?;
+        for pair in segments.windows(2) {
+            let previous = pair[0];
+            let next = pair[1];
+            if next.start_sample() != previous.end_sample() {
+                return Err(RenderError::NonContiguousTrajectory {
+                    previous_end: previous.end_sample(),
+                    next_start: next.start_sample(),
+                });
+            }
+            if next.start_state() != previous.end_state() {
+                return Err(RenderError::DiscontinuousTrajectory {
+                    boundary: next.start_sample(),
+                });
+            }
+        }
+        Ok(Self { segments })
+    }
+
+    /// Returns the inclusive trajectory domain.
+    #[must_use]
+    pub fn domain(&self) -> (u64, u64) {
+        (
+            self.segments[0].start_sample(),
+            self.segments[self.segments.len() - 1].end_sample(),
+        )
+    }
+
+    /// Returns the validated segments.
+    #[must_use]
+    pub fn segments(&self) -> &[TrajectorySegment2d] {
+        &self.segments
+    }
+
+    /// Evaluates the state at an absolute trajectory sample index.
+    pub fn evaluate(&self, sample: u64) -> Result<SpatialState2d, RenderError> {
+        let (start, end) = self.domain();
+        if sample < start || sample > end {
+            return Err(RenderError::TrajectorySampleOutOfRange { sample });
+        }
+        let index = self
+            .segments
+            .partition_point(|segment| segment.end_sample() < sample);
+        self.segments[index.min(self.segments.len() - 1)].evaluate(sample)
+    }
+
+    fn validate_block(&self, start: u64, length: usize) -> Result<(), RenderError> {
+        let end_exclusive = start
+            .checked_add(length as u64)
+            .ok_or(RenderError::SampleIndexOverflow)?;
+        let (domain_start, domain_end) = self.domain();
+        if length > 0 && (start < domain_start || end_exclusive - 1 > domain_end) {
+            return Err(RenderError::TrajectoryBlockOutOfRange {
+                start,
+                length,
+                domain_start,
+                domain_end,
+            });
+        }
+        if length == 0 && (start < domain_start || start > domain_end.saturating_add(1)) {
+            return Err(RenderError::TrajectoryBlockOutOfRange {
+                start,
+                length,
+                domain_start,
+                domain_end,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A borrowed mono PCM block bound to an absolute source trajectory range.
+#[derive(Clone, Copy, Debug)]
+pub struct TrajectorySourceBlock<'a> {
+    id: SourceId,
+    samples: &'a [f64],
+    trajectory: &'a SourceTrajectory2d,
+    block_start_sample: u64,
+}
+
+/// A canonical unit-direction state for a three-dimensional source trajectory.
+///
+/// The input Cartesian vector is normalized at construction. Its magnitude is
+/// never interpreted as distance or attenuation; only the explicit linear
+/// gain is rendered.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpatialState3d {
+    direction: [f64; 3],
+    gain: f64,
+}
+
+impl SpatialState3d {
+    /// Creates a finite, nonzero directional state with a linear gain.
+    pub fn new(position: CartesianPosition, gain: f64) -> Result<Self, RenderError> {
+        let direction = normalized_3d(position)?;
+        validate_gain(gain)?;
+        Ok(Self { direction, gain })
+    }
+
+    /// Returns the canonical unit direction as a Cartesian position.
+    #[must_use]
+    pub const fn position(self) -> CartesianPosition {
+        CartesianPosition::new(self.direction[0], self.direction[1], self.direction[2])
+    }
+
+    /// Returns the canonical unit direction components in x/y/z order.
+    #[must_use]
+    pub const fn direction(self) -> [f64; 3] {
+        self.direction
+    }
+
+    /// Returns the finite linear source gain.
+    #[must_use]
+    pub const fn gain(self) -> f64 {
+        self.gain
+    }
+}
+
+/// One inclusive shortest-great-circle segment on an absolute sample timeline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrajectorySegment3d {
+    start_sample: u64,
+    end_sample: u64,
+    start_state: SpatialState3d,
+    end_state: SpatialState3d,
+}
+
+impl TrajectorySegment3d {
+    /// Creates a segment with inclusive endpoints and shortest-arc semantics.
+    pub fn new(
+        start_sample: u64,
+        end_sample: u64,
+        start_state: SpatialState3d,
+        end_state: SpatialState3d,
+    ) -> Result<Self, RenderError> {
+        if end_sample <= start_sample {
+            return Err(RenderError::InvalidTrajectorySegment {
+                start_sample,
+                end_sample,
+            });
+        }
+        let span = end_sample - start_sample;
+        if span > MAX_EXACT_INTERPOLATION_SPAN {
+            return Err(RenderError::TrajectorySpanTooLarge { span });
+        }
+        // Validate the path policy at construction, before any caller output
+        // can be touched. Exact endpoints are handled separately in evaluate.
+        let _ = great_circle_direction(start_state.direction, end_state.direction, 0.5)?;
+        Ok(Self {
+            start_sample,
+            end_sample,
+            start_state,
+            end_state,
+        })
+    }
+
+    /// Returns the inclusive first sample index.
+    #[must_use]
+    pub const fn start_sample(self) -> u64 {
+        self.start_sample
+    }
+
+    /// Returns the inclusive final sample index.
+    #[must_use]
+    pub const fn end_sample(self) -> u64 {
+        self.end_sample
+    }
+
+    /// Returns the exact canonical start state.
+    #[must_use]
+    pub const fn start_state(self) -> SpatialState3d {
+        self.start_state
+    }
+
+    /// Returns the exact canonical end state.
+    #[must_use]
+    pub const fn end_state(self) -> SpatialState3d {
+        self.end_state
+    }
+
+    fn evaluate(self, sample: u64) -> Result<SpatialState3d, RenderError> {
+        if sample < self.start_sample || sample > self.end_sample {
+            return Err(RenderError::TrajectorySampleOutOfRange { sample });
+        }
+        if sample == self.start_sample {
+            return Ok(self.start_state);
+        }
+        if sample == self.end_sample {
+            return Ok(self.end_state);
+        }
+        let span = self.end_sample - self.start_sample;
+        let offset = sample - self.start_sample;
+        let t = offset as f64 / span as f64;
+        let direction =
+            great_circle_direction(self.start_state.direction, self.end_state.direction, t)?;
+        let gain = self
+            .start_state
+            .gain
+            .mul_add(1.0 - t, self.end_state.gain * t);
+        SpatialState3d::from_direction(direction, gain)
+    }
+}
+
+impl SpatialState3d {
+    fn from_direction(direction: [f64; 3], gain: f64) -> Result<Self, RenderError> {
+        if direction.iter().any(|value| !value.is_finite()) {
+            return Err(RenderError::Invalid3dTrajectoryState);
+        }
+        validate_gain(gain)?;
+        let norm = direction
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(RenderError::Invalid3dTrajectoryState);
+        }
+        Ok(Self {
+            direction: [
+                direction[0] / norm,
+                direction[1] / norm,
+                direction[2] / norm,
+            ],
+            gain,
+        })
+    }
+}
+
+/// A contiguous, validated piecewise-shortest-great-circle source trajectory.
+#[derive(Clone, Debug)]
+pub struct SourceTrajectory3d {
+    segments: Vec<TrajectorySegment3d>,
+}
+
+impl SourceTrajectory3d {
+    /// Creates a non-empty trajectory with contiguous, continuous keyframes.
+    pub fn new(segments: Vec<TrajectorySegment3d>) -> Result<Self, RenderError> {
+        segments
+            .first()
+            .copied()
+            .ok_or(RenderError::EmptyTrajectory)?;
+        for pair in segments.windows(2) {
+            let previous = pair[0];
+            let next = pair[1];
+            if next.start_sample() != previous.end_sample() {
+                return Err(RenderError::NonContiguousTrajectory {
+                    previous_end: previous.end_sample(),
+                    next_start: next.start_sample(),
+                });
+            }
+            if !trajectory_states_match_3d(previous.end_state(), next.start_state()) {
+                return Err(RenderError::Discontinuous3dTrajectory {
+                    boundary: next.start_sample(),
+                });
+            }
+        }
+        Ok(Self { segments })
+    }
+
+    /// Returns the inclusive trajectory domain.
+    #[must_use]
+    pub fn domain(&self) -> (u64, u64) {
+        (
+            self.segments[0].start_sample(),
+            self.segments[self.segments.len() - 1].end_sample(),
+        )
+    }
+
+    /// Returns the validated segments.
+    #[must_use]
+    pub fn segments(&self) -> &[TrajectorySegment3d] {
+        &self.segments
+    }
+
+    /// Evaluates one absolute sample index.
+    pub fn evaluate(&self, sample: u64) -> Result<SpatialState3d, RenderError> {
+        let (start, end) = self.domain();
+        if sample < start || sample > end {
+            return Err(RenderError::TrajectorySampleOutOfRange { sample });
+        }
+        let index = self
+            .segments
+            .partition_point(|segment| segment.end_sample() < sample);
+        self.segments[index.min(self.segments.len() - 1)].evaluate(sample)
+    }
+
+    fn validate_block(&self, start: u64, length: usize) -> Result<(), RenderError> {
+        let end_exclusive = start
+            .checked_add(length as u64)
+            .ok_or(RenderError::SampleIndexOverflow)?;
+        let (domain_start, domain_end) = self.domain();
+        if length > 0 && (start < domain_start || end_exclusive - 1 > domain_end) {
+            return Err(RenderError::TrajectoryBlockOutOfRange {
+                start,
+                length,
+                domain_start,
+                domain_end,
+            });
+        }
+        if length == 0 && (start < domain_start || start > domain_end.saturating_add(1)) {
+            return Err(RenderError::TrajectoryBlockOutOfRange {
+                start,
+                length,
+                domain_start,
+                domain_end,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A borrowed mono PCM block bound to a 3D trajectory and absolute offset.
+#[derive(Clone, Copy, Debug)]
+pub struct TrajectorySourceBlock3d<'a> {
+    id: SourceId,
+    samples: &'a [f64],
+    trajectory: &'a SourceTrajectory3d,
+    block_start_sample: u64,
+}
+
+impl<'a> TrajectorySourceBlock3d<'a> {
+    /// Creates a block after validating its samples and absolute range.
+    pub fn new(
+        id: SourceId,
+        samples: &'a [f64],
+        trajectory: &'a SourceTrajectory3d,
+        block_start_sample: u64,
+    ) -> Result<Self, RenderError> {
+        trajectory.validate_block(block_start_sample, samples.len())?;
+        if let Some(sample_index) = samples.iter().position(|sample| !sample.is_finite()) {
+            return Err(RenderError::NonFiniteSourceSample { id, sample_index });
+        }
+        Ok(Self {
+            id,
+            samples,
+            trajectory,
+            block_start_sample,
+        })
+    }
+
+    /// Returns the source identity.
+    #[must_use]
+    pub const fn id(self) -> SourceId {
+        self.id
+    }
+
+    /// Returns the borrowed source samples.
+    #[must_use]
+    pub const fn samples(self) -> &'a [f64] {
+        self.samples
+    }
+
+    /// Returns the referenced 3D trajectory.
+    #[must_use]
+    pub const fn trajectory(self) -> &'a SourceTrajectory3d {
+        self.trajectory
+    }
+
+    /// Returns the absolute index of the first sample in this block.
+    #[must_use]
+    pub const fn block_start_sample(self) -> u64 {
+        self.block_start_sample
+    }
+}
+
+/// Opaque identity for one caller-supplied HRIR entry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HrirEntryId(u64);
+
+impl HrirEntryId {
+    /// Creates an HRIR entry identity from a caller-owned value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the caller-owned identity value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Selects one ear of a caller-supplied HRIR pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HrirEar {
+    /// Left-ear impulse response.
+    Left,
+    /// Right-ear impulse response.
+    Right,
+}
+
+/// A validated, caller-supplied pair of causal HRIR/FIR taps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HrirPair {
+    sample_rate_hz: u32,
+    left: Vec<f64>,
+    right: Vec<f64>,
+    delays: [usize; 2],
+}
+
+impl HrirPair {
+    /// Creates a pair without changing, normalizing, trimming, or resampling taps.
+    pub fn new(sample_rate_hz: u32, left: Vec<f64>, right: Vec<f64>) -> Result<Self, RenderError> {
+        Self::new_with_delays(sample_rate_hz, left, right, [0, 0])
+    }
+
+    /// Creates a pair with explicit causal sample delays for the two ears.
+    ///
+    /// The tap vectors remain fully expanded causal FIRs. Delay metadata is
+    /// retained separately so a spatial interpolator can remove measured
+    /// onset before averaging the HRIR shape and restore the interpolated
+    /// onset without changing exact-direction rendering.
+    pub fn new_with_delays(
+        sample_rate_hz: u32,
+        left: Vec<f64>,
+        right: Vec<f64>,
+        delays: [usize; 2],
+    ) -> Result<Self, RenderError> {
+        if sample_rate_hz == 0 {
+            return Err(RenderError::InvalidSampleRate);
+        }
+        if left.is_empty() || right.is_empty() {
+            return Err(RenderError::EmptyHrir);
+        }
+        if left.len() != right.len() {
+            return Err(RenderError::MismatchedHrirTapLength {
+                left: left.len(),
+                right: right.len(),
+            });
+        }
+        for (ear, taps) in [(HrirEar::Left, &left), (HrirEar::Right, &right)] {
+            if let Some(tap_index) = taps.iter().position(|tap| !tap.is_finite()) {
+                return Err(RenderError::NonFiniteHrirTap { ear, tap_index });
+            }
+        }
+        for (ear, (delay, taps)) in delays.into_iter().zip([&left, &right]).enumerate() {
+            if delay > taps.len() {
+                return Err(RenderError::InvalidHrirDelay {
+                    ear: if ear == 0 {
+                        HrirEar::Left
+                    } else {
+                        HrirEar::Right
+                    },
+                    delay,
+                    tap_count: taps.len(),
+                });
+            }
+        }
+        Ok(Self {
+            sample_rate_hz,
+            left,
+            right,
+            delays,
+        })
+    }
+
+    /// Returns the exact source sample rate.
+    #[must_use]
+    pub const fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    /// Returns the left-ear taps in causal order.
+    #[must_use]
+    pub fn left_taps(&self) -> &[f64] {
+        &self.left
+    }
+
+    /// Returns the right-ear taps in causal order.
+    #[must_use]
+    pub fn right_taps(&self) -> &[f64] {
+        &self.right
+    }
+
+    /// Returns the equal left/right tap count.
+    #[must_use]
+    pub fn tap_count(&self) -> usize {
+        self.left.len()
+    }
+
+    /// Returns the explicit source delay for one ear.
+    #[must_use]
+    pub const fn delay_samples(&self, ear: HrirEar) -> usize {
+        match ear {
+            HrirEar::Left => self.delays[0],
+            HrirEar::Right => self.delays[1],
+        }
+    }
+}
+
+/// One exact-direction HRIR entry in an immutable caller-provided bank.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HrirEntry {
+    id: HrirEntryId,
+    direction: [f64; 3],
+    pair: HrirPair,
+}
+
+impl HrirEntry {
+    /// Creates an entry and canonicalizes its finite nonzero direction.
+    pub fn new(
+        id: HrirEntryId,
+        direction: CartesianPosition,
+        pair: HrirPair,
+    ) -> Result<Self, RenderError> {
+        Ok(Self {
+            id,
+            direction: normalized_3d(direction)?,
+            pair,
+        })
+    }
+
+    /// Returns this entry's stable identity.
+    #[must_use]
+    pub const fn id(&self) -> HrirEntryId {
+        self.id
+    }
+
+    /// Returns this entry's canonical unit direction.
+    #[must_use]
+    pub const fn direction(&self) -> [f64; 3] {
+        self.direction
+    }
+
+    /// Returns the authoritative pair of causal taps.
+    #[must_use]
+    pub const fn pair(&self) -> &HrirPair {
+        &self.pair
+    }
+}
+
+/// An immutable exact-direction HRIR provider; it performs no interpolation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HrirBank {
+    sample_rate_hz: u32,
+    entries: Vec<HrirEntry>,
+}
+
+impl HrirBank {
+    /// Creates a nonempty bank with one exact sample rate and unique directions.
+    pub fn new(sample_rate_hz: u32, entries: Vec<HrirEntry>) -> Result<Self, RenderError> {
+        if sample_rate_hz == 0 {
+            return Err(RenderError::InvalidSampleRate);
+        }
+        if entries.is_empty() {
+            return Err(RenderError::EmptyHrirBank);
+        }
+        for entry in &entries {
+            if entry.pair.sample_rate_hz() != sample_rate_hz {
+                return Err(RenderError::HrirSampleRateMismatch {
+                    expected: sample_rate_hz,
+                    actual: entry.pair.sample_rate_hz(),
+                });
+            }
+        }
+        let mut ids = HashSet::with_capacity(entries.len());
+        for entry in &entries {
+            if !ids.insert(entry.id) {
+                return Err(RenderError::DuplicateHrirEntryId { id: entry.id });
+            }
+        }
+        Self::validate_unique_canonical_hrir_directions(entries.len(), |index| {
+            entries[index].direction
+        })?;
+        Ok(Self {
+            sample_rate_hz,
+            entries,
+        })
+    }
+
+    /// Rejects duplicate unit directions using the bank's canonical tolerance.
+    ///
+    /// Directions must already be finite and normalized, as they are in [`HrirEntry::direction`].
+    pub fn validate_unique_canonical_hrir_directions(
+        direction_count: usize,
+        direction_at: impl Fn(usize) -> [f64; 3],
+    ) -> Result<(), RenderError> {
+        let mut direction_grid: HashMap<[i64; 3], Vec<usize>> =
+            HashMap::with_capacity(direction_count);
+        for second in 0..direction_count {
+            let direction = direction_at(second);
+            let cell = hrir_direction_cell(direction);
+            // The direction dot tolerance permits less than two grid cells of
+            // component-wise displacement; search the adjacent cells in 3D.
+            for dx in -2..=2 {
+                for dy in -2..=2 {
+                    for dz in -2..=2 {
+                        let neighbor = [cell[0] + dx, cell[1] + dy, cell[2] + dz];
+                        if let Some(candidates) = direction_grid.get(&neighbor) {
+                            if let Some(&first) = candidates.iter().find(|&&candidate| {
+                                same_direction_3d(direction_at(candidate), direction)
+                            }) {
+                                return Err(RenderError::DuplicateHrirDirection { first, second });
+                            }
+                        }
+                    }
+                }
+            }
+            direction_grid.entry(cell).or_default().push(second);
+        }
+        Ok(())
+    }
+
+    /// Returns the bank sample rate.
+    #[must_use]
+    pub const fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    /// Returns entries in immutable caller order.
+    #[must_use]
+    pub fn entries(&self) -> &[HrirEntry] {
+        &self.entries
+    }
+
+    /// Resolves one exact direction, rejecting unsupported and ambiguous queries.
+    pub fn resolve_exact(&self, direction: CartesianPosition) -> Result<&HrirEntry, RenderError> {
+        let direction = normalized_3d(direction)?;
+        let mut match_index = None;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if same_direction_3d(direction, entry.direction) {
+                if let Some(first) = match_index {
+                    return Err(RenderError::AmbiguousHrirDirection {
+                        first,
+                        second: index,
+                    });
+                }
+                match_index = Some(index);
+            }
+        }
+        match_index
+            .map(|index| &self.entries[index])
+            .ok_or(RenderError::UnsupportedHrirDirection {
+                x: direction[0],
+                y: direction[1],
+                z: direction[2],
+            })
+    }
+}
+
+/// A fixed explicit source binding for one static binaural renderer stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StaticBinauralSource {
+    id: SourceId,
+    direction: [f64; 3],
+    gain: f64,
+    hrir_entry: HrirEntryId,
+}
+
+impl StaticBinauralSource {
+    /// Creates a source bound to one exact HRIR entry identity.
+    pub fn new(
+        id: SourceId,
+        direction: CartesianPosition,
+        gain: f64,
+        hrir_entry: HrirEntryId,
+    ) -> Result<Self, RenderError> {
+        let direction = normalized_3d(direction)?;
+        validate_gain(gain)?;
+        Ok(Self {
+            id,
+            direction,
+            gain,
+            hrir_entry,
+        })
+    }
+
+    /// Returns the source identity.
+    #[must_use]
+    pub const fn id(self) -> SourceId {
+        self.id
+    }
+
+    /// Returns the canonical static source direction.
+    #[must_use]
+    pub const fn direction(self) -> [f64; 3] {
+        self.direction
+    }
+
+    /// Returns the explicit linear source gain.
+    #[must_use]
+    pub const fn gain(self) -> f64 {
+        self.gain
+    }
+
+    /// Returns the bound HRIR entry identity.
+    #[must_use]
+    pub const fn hrir_entry(self) -> HrirEntryId {
+        self.hrir_entry
+    }
+}
+
+/// One caller-owned mono block identified by a registered source ID.
+#[derive(Clone, Copy, Debug)]
+pub struct BinauralSourceBlock<'a> {
+    id: SourceId,
+    samples: &'a [f64],
+}
+
+impl<'a> BinauralSourceBlock<'a> {
+    /// Creates an input block without copying caller PCM.
+    #[must_use]
+    pub const fn new(id: SourceId, samples: &'a [f64]) -> Self {
+        Self { id, samples }
+    }
+
+    /// Returns the source identity.
+    #[must_use]
+    pub const fn id(self) -> SourceId {
+        self.id
+    }
+
+    /// Returns the borrowed mono samples.
+    #[must_use]
+    pub const fn samples(self) -> &'a [f64] {
+        self.samples
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BinauralRegisteredSource {
+    definition: StaticBinauralSource,
+    left_taps: Vec<f64>,
+    right_taps: Vec<f64>,
+    history: Vec<f64>,
+    tail_remaining: usize,
+}
+
+/// A static-source binaural renderer using caller-supplied exact-direction HRIRs.
+#[derive(Clone, Debug)]
+pub struct BinauralRenderer {
+    sample_rate_hz: u32,
+    sources: Vec<BinauralRegisteredSource>,
+    tail_started: bool,
+    finished: bool,
+    requires_reset: bool,
+}
+
+impl BinauralRenderer {
+    /// Creates a fixed source set and resolves every source to one exact HRIR entry.
+    pub fn new(
+        sample_rate_hz: u32,
+        bank: HrirBank,
+        sources: Vec<StaticBinauralSource>,
+    ) -> Result<Self, RenderError> {
+        let HrirBank {
+            sample_rate_hz: bank_sample_rate_hz,
+            entries,
+        } = bank;
+        if sample_rate_hz == 0 {
+            return Err(RenderError::InvalidSampleRate);
+        }
+        if bank_sample_rate_hz != sample_rate_hz {
+            return Err(RenderError::HrirSampleRateMismatch {
+                expected: sample_rate_hz,
+                actual: bank_sample_rate_hz,
+            });
+        }
+        if sources.is_empty() {
+            return Err(RenderError::EmptyBinauralSourceSet);
+        }
+        for first in 0..sources.len() {
+            for second in first + 1..sources.len() {
+                if sources[first].id == sources[second].id {
+                    return Err(RenderError::DuplicateSourceId {
+                        id: sources[first].id,
+                    });
+                }
+            }
+        }
+        let mut registered = Vec::with_capacity(sources.len());
+        for definition in sources {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == definition.hrir_entry)
+                .ok_or(RenderError::UnknownHrirEntry {
+                    id: definition.hrir_entry,
+                })?;
+            if !same_direction_3d(definition.direction, entry.direction) {
+                return Err(RenderError::HrirEntryDirectionMismatch {
+                    source: definition.id,
+                    entry: definition.hrir_entry,
+                });
+            }
+            let history_len = entry
+                .pair
+                .tap_count()
+                .checked_sub(1)
+                .ok_or(RenderError::HrirStateSizeOverflow)?;
+            registered.push(BinauralRegisteredSource {
+                definition,
+                left_taps: entry.pair.left.clone(),
+                right_taps: entry.pair.right.clone(),
+                history: vec![0.0; history_len],
+                tail_remaining: 0,
+            });
+        }
+        Ok(Self {
+            sample_rate_hz,
+            sources: registered,
+            tail_started: false,
+            finished: false,
+            requires_reset: false,
+        })
+    }
+
+    /// Returns the renderer's exact PCM sample rate.
+    #[must_use]
+    pub const fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    /// Returns the frozen registered source count.
+    #[must_use]
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Returns bytes currently owned by registered HRIR taps and FIR histories.
+    #[must_use]
+    pub fn hrir_tap_storage_bytes(&self) -> usize {
+        self.hrir_kernel_storage_bytes() + self.hrir_history_storage_bytes()
+    }
+
+    /// Returns bytes currently owned by the registered left/right FIR taps.
+    #[must_use]
+    pub fn hrir_kernel_storage_bytes(&self) -> usize {
+        self.sources
+            .iter()
+            .map(|source| {
+                (source.left_taps.capacity() + source.right_taps.capacity())
+                    * std::mem::size_of::<f64>()
+            })
+            .sum()
+    }
+
+    /// Returns bytes currently owned by registered input-history state.
+    #[must_use]
+    pub fn hrir_history_storage_bytes(&self) -> usize {
+        self.sources
+            .iter()
+            .map(|source| source.history.capacity() * std::mem::size_of::<f64>())
+            .sum()
+    }
+
+    /// Returns the fixed source definitions in registration order.
+    #[must_use = "the registered source definitions are needed to inspect the renderer contract"]
+    pub fn sources(&self) -> impl Iterator<Item = StaticBinauralSource> + '_ {
+        self.sources.iter().map(|source| source.definition)
+    }
+
+    /// Returns the largest remaining causal FIR tail in samples.
+    #[must_use]
+    pub fn remaining_tail_samples(&self) -> usize {
+        self.sources
+            .iter()
+            .map(|source| source.tail_remaining)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Returns whether zero-input tail draining has begun.
+    #[must_use]
+    pub const fn tail_started(&self) -> bool {
+        self.tail_started
+    }
+
+    /// Returns whether the stream has completed its tail.
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Renders one equal-length mono block per registered source.
+    ///
+    /// Blocks are resolved by `SourceId`, so caller declaration order does not
+    /// affect deterministic registered-source accumulation order. Structural
+    /// errors are validated before outputs or FIR history are changed.
+    pub fn render_block(
+        &mut self,
+        blocks: &[BinauralSourceBlock<'_>],
+        left: &mut [f64],
+        right: &mut [f64],
+    ) -> Result<(), RenderError> {
+        if left.len() < 4 {
+            self.render_block_impl::<false>(blocks, left, right)
+        } else {
+            self.render_block_impl::<true>(blocks, left, right)
+        }
+    }
+
+    // Tiny blocks cannot contain a SIMD group, so they use the portable body
+    // without per-source dispatch overhead. Tests also force this body on an
+    // AVX-capable host, without a public switch or process-global state.
+    #[inline(never)]
+    fn render_block_impl<const ACCELERATE: bool>(
+        &mut self,
+        blocks: &[BinauralSourceBlock<'_>],
+        left: &mut [f64],
+        right: &mut [f64],
+    ) -> Result<(), RenderError> {
+        self.ensure_renderable()?;
+        validate_binaural_outputs(left, right)?;
+        if blocks.len() != self.sources.len() {
+            return Err(RenderError::BinauralSourceCountMismatch {
+                expected: self.sources.len(),
+                actual: blocks.len(),
+            });
+        }
+        let block_length = left.len();
+        for (block_index, block) in blocks.iter().enumerate() {
+            if block.samples.len() != block_length {
+                return Err(RenderError::SourceBlockLengthMismatch {
+                    id: block.id,
+                    expected: block_length,
+                    actual: block.samples.len(),
+                });
+            }
+            if self
+                .sources
+                .iter()
+                .all(|source| source.definition.id != block.id)
+            {
+                return Err(RenderError::UnknownBinauralSource { id: block.id });
+            }
+            if blocks[..block_index]
+                .iter()
+                .any(|previous| previous.id == block.id)
+            {
+                return Err(RenderError::DuplicateBinauralSource { id: block.id });
+            }
+            if let Some(sample_index) = block.samples.iter().position(|sample| !sample.is_finite())
+            {
+                return Err(RenderError::NonFiniteSourceSample {
+                    id: block.id,
+                    sample_index,
+                });
+            }
+        }
+        for source in &self.sources {
+            if blocks.iter().all(|block| block.id != source.definition.id) {
+                return Err(RenderError::MissingBinauralSource {
+                    id: source.definition.id,
+                });
+            }
+        }
+        left.fill(0.0);
+        right.fill(0.0);
+        if block_length == 0 {
+            return Ok(());
+        }
+        for source in &mut self.sources {
+            let block = blocks
+                .iter()
+                .find(|block| block.id == source.definition.id)
+                .ok_or(RenderError::MissingBinauralSource {
+                    id: source.definition.id,
+                })?;
+            let history_len = source.history.len();
+            let mut offset = 0;
+            while offset < block_length {
+                if ACCELERATE && offset == history_len && block_length - offset >= 4 {
+                    offset = match direct_fir::accumulate_interior(
+                        source,
+                        block.samples,
+                        left,
+                        right,
+                        offset,
+                    ) {
+                        Ok(next) => next,
+                        Err((channel, sample_index)) => {
+                            return self.numeric_failure(left, right, channel, sample_index);
+                        }
+                    };
+                    if offset == block_length {
+                        break;
+                    }
+                }
+                let mut left_acc = left[offset];
+                let mut right_acc = right[offset];
+                // Keep ascending tap order across both ranges. Current-block
+                // samples need gain; history already contains gained samples.
+                let current_taps = source.left_taps.len().min(offset + 1);
+                for tap_index in 0..current_taps {
+                    let input = block.samples[offset - tap_index] * source.definition.gain;
+                    left_acc += input * source.left_taps[tap_index];
+                    right_acc += input * source.right_taps[tap_index];
+                }
+                for tap_index in current_taps..source.left_taps.len() {
+                    let input = source.history[history_len - (tap_index - offset)];
+                    left_acc += input * source.left_taps[tap_index];
+                    right_acc += input * source.right_taps[tap_index];
+                }
+                left[offset] = left_acc;
+                right[offset] = right_acc;
+                if !left[offset].is_finite() {
+                    return self.numeric_failure(left, right, OutputChannel::Left, offset);
+                }
+                if !right[offset].is_finite() {
+                    return self.numeric_failure(left, right, OutputChannel::Right, offset);
+                }
+                offset += 1;
+            }
+        }
+        for source in &mut self.sources {
+            let block = blocks
+                .iter()
+                .find(|block| block.id == source.definition.id)
+                .ok_or(RenderError::MissingBinauralSource {
+                    id: source.definition.id,
+                })?;
+            update_binaural_history(&mut source.history, block.samples, source.definition.gain);
+            source.tail_remaining = source.history.len();
+        }
+        Ok(())
+    }
+
+    /// Drains a bounded caller-owned block of the remaining causal FIR tail.
+    pub fn drain_tail_block(
+        &mut self,
+        left: &mut [f64],
+        right: &mut [f64],
+    ) -> Result<(), RenderError> {
+        if self.requires_reset {
+            return Err(RenderError::BinauralRequiresReset);
+        }
+        if self.finished {
+            return Err(RenderError::BinauralAlreadyFinished);
+        }
+        validate_binaural_outputs(left, right)?;
+        let requested = left.len();
+        let remaining = self.remaining_tail_samples();
+        if requested > remaining {
+            return Err(RenderError::TailOutputLengthMismatch {
+                requested,
+                remaining,
+            });
+        }
+        self.tail_started = true;
+        left.fill(0.0);
+        right.fill(0.0);
+        for source in &self.sources {
+            for offset in 0..requested {
+                if offset >= source.tail_remaining {
+                    continue;
+                }
+                let history_len = source.history.len();
+                for tap_index in 0..source.left_taps.len() {
+                    let input = if tap_index == 0 || tap_index <= offset {
+                        0.0
+                    } else {
+                        let history_index = history_len - tap_index + offset;
+                        if history_index < history_len {
+                            source.history[history_index]
+                        } else {
+                            0.0
+                        }
+                    };
+                    left[offset] += input * source.left_taps[tap_index];
+                    right[offset] += input * source.right_taps[tap_index];
+                }
+                if !left[offset].is_finite() {
+                    return self.numeric_failure(left, right, OutputChannel::Left, offset);
+                }
+                if !right[offset].is_finite() {
+                    return self.numeric_failure(left, right, OutputChannel::Right, offset);
+                }
+            }
+        }
+        for source in &mut self.sources {
+            if requested >= source.history.len() {
+                source.history.fill(0.0);
+            } else if requested > 0 {
+                source.history.copy_within(requested.., 0);
+                let fill_start = source.history.len() - requested;
+                source.history[fill_start..].fill(0.0);
+            }
+            source.tail_remaining -= requested.min(source.tail_remaining);
+        }
+        if self.remaining_tail_samples() == 0 {
+            self.finished = true;
+        }
+        Ok(())
+    }
+
+    /// Clears FIR history and lifecycle state while preserving source registration.
+    pub fn reset(&mut self) {
+        for source in &mut self.sources {
+            source.history.fill(0.0);
+            source.tail_remaining = 0;
+        }
+        self.tail_started = false;
+        self.finished = false;
+        self.requires_reset = false;
+    }
+
+    fn ensure_renderable(&self) -> Result<(), RenderError> {
+        if self.requires_reset {
+            return Err(RenderError::BinauralRequiresReset);
+        }
+        if self.tail_started {
+            return Err(RenderError::BinauralInputAfterTailStart);
+        }
+        Ok(())
+    }
+
+    fn numeric_failure(
+        &mut self,
+        left: &mut [f64],
+        right: &mut [f64],
+        channel: OutputChannel,
+        sample_index: usize,
+    ) -> Result<(), RenderError> {
+        left.fill(0.0);
+        right.fill(0.0);
+        self.requires_reset = true;
+        Err(RenderError::NonFiniteOutput {
+            channel,
+            sample_index,
+        })
+    }
+}
+
+impl<'a> TrajectorySourceBlock<'a> {
+    /// Creates a block after validating samples and its absolute range.
+    pub fn new(
+        id: SourceId,
+        samples: &'a [f64],
+        trajectory: &'a SourceTrajectory2d,
+        block_start_sample: u64,
+    ) -> Result<Self, RenderError> {
+        trajectory.validate_block(block_start_sample, samples.len())?;
+        if let Some(sample_index) = samples.iter().position(|sample| !sample.is_finite()) {
+            return Err(RenderError::NonFiniteSourceSample { id, sample_index });
+        }
+        Ok(Self {
+            id,
+            samples,
+            trajectory,
+            block_start_sample,
+        })
+    }
+
+    /// Returns the opaque source identity.
+    #[must_use]
+    pub const fn id(self) -> SourceId {
+        self.id
+    }
+
+    /// Returns the borrowed source samples.
+    #[must_use]
+    pub const fn samples(self) -> &'a [f64] {
+        self.samples
+    }
+
+    /// Returns the referenced trajectory.
+    #[must_use]
+    pub const fn trajectory(self) -> &'a SourceTrajectory2d {
+        self.trajectory
+    }
+
+    /// Returns the absolute sample index of the first sample in this block.
+    #[must_use]
+    pub const fn block_start_sample(self) -> u64 {
+        self.block_start_sample
+    }
+}
+
+/// An opaque caller-provided identity for one output speaker.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SpeakerId(u64);
+
+impl SpeakerId {
+    /// Creates an opaque speaker identity from a caller-owned value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the caller-owned identity value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// One full-range horizontal speaker direction in the caller's output order.
+///
+/// The horizontal projection of `position` defines the speaker direction. The
+/// `z` component is retained for coordinate completeness but is ignored by
+/// the two-dimensional renderer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Speaker2d {
+    id: SpeakerId,
+    position: CartesianPosition,
+}
+
+impl Speaker2d {
+    /// Creates a speaker after validating its finite, nonzero horizontal
+    /// direction.
+    pub fn new(id: SpeakerId, position: CartesianPosition) -> Result<Self, RenderError> {
+        validate_position(position)?;
+        if horizontal_magnitude_squared(position) <= 0.0 {
+            return Err(RenderError::UndefinedSpeakerDirection { id });
+        }
+        Ok(Self { id, position })
+    }
+
+    /// Returns the opaque speaker identity.
+    #[must_use]
+    pub const fn id(self) -> SpeakerId {
+        self.id
+    }
+
+    /// Returns the speaker's Cartesian direction.
+    #[must_use]
+    pub const fn position(self) -> CartesianPosition {
+        self.position
+    }
+}
+
+/// A deterministic adjacent-speaker pair selected by a two-dimensional layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpeakerPair2d {
+    first_index: usize,
+    second_index: usize,
+}
+
+impl SpeakerPair2d {
+    /// Returns the first public output index in angular order.
+    #[must_use]
+    pub const fn first_index(self) -> usize {
+        self.first_index
+    }
+
+    /// Returns the second public output index in angular order.
+    #[must_use]
+    pub const fn second_index(self) -> usize {
+        self.second_index
+    }
+}
+
+/// Energy-normalized gains for one selected two-dimensional speaker pair.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PairGains2d {
+    pair: SpeakerPair2d,
+    first: f64,
+    second: f64,
+}
+
+impl PairGains2d {
+    /// Returns the selected public output pair.
+    #[must_use]
+    pub const fn pair(self) -> SpeakerPair2d {
+        self.pair
+    }
+
+    /// Returns the first pair gain.
+    #[must_use]
+    pub const fn first(self) -> f64 {
+        self.first
+    }
+
+    /// Returns the second pair gain.
+    #[must_use]
+    pub const fn second(self) -> f64 {
+        self.second
+    }
+}
+
+/// A caller-declared horizontal speaker layout.
+///
+/// The input slice order is the public output-channel order. Internal azimuth
+/// sorting is used only to construct adjacent panning sectors; it never
+/// changes the caller-visible output-plane order. Layout construction may
+/// allocate bounded speaker/pair metadata, while rendering uses no
+/// per-sample allocation.
+#[derive(Clone, Debug)]
+pub struct SpeakerLayout2d {
+    speakers: Vec<Speaker2d>,
+    directions: Vec<(f64, f64, f64)>,
+    sorted_indices: Vec<usize>,
+    pairs: Vec<LayoutPair>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LayoutPair {
+    pair: SpeakerPair2d,
+    start_angle: f64,
+    end_angle: f64,
+}
+
+impl SpeakerLayout2d {
+    /// Builds a layout from the caller-declared public output order.
+    pub fn new(speakers: Vec<Speaker2d>) -> Result<Self, RenderError> {
+        if speakers.len() < 2 {
+            return Err(RenderError::TooFewSpeakers {
+                actual: speakers.len(),
+            });
+        }
+
+        for (index, speaker) in speakers.iter().enumerate() {
+            if speakers[index + 1..]
+                .iter()
+                .any(|other| other.id == speaker.id)
+            {
+                return Err(RenderError::DuplicateSpeakerId { id: speaker.id });
+            }
+        }
+
+        let directions: Vec<_> = speakers
+            .iter()
+            .map(|speaker| normalized_horizontal(speaker.position))
+            .collect::<Result<_, _>>()?;
+        let mut sorted_indices: Vec<_> = (0..speakers.len()).collect();
+        sorted_indices.sort_by(|&left, &right| {
+            directions[left]
+                .2
+                .total_cmp(&directions[right].2)
+                .then_with(|| left.cmp(&right))
+        });
+
+        for window in sorted_indices.windows(2) {
+            let first = directions[window[0]].2;
+            let second = directions[window[1]].2;
+            if second - first <= ANGLE_TOLERANCE {
+                return Err(RenderError::DuplicateSpeakerAzimuth {
+                    first: window[0],
+                    second: window[1],
+                });
+            }
+        }
+
+        let mut pairs = Vec::new();
+        for (sorted_position, &first_index) in sorted_indices.iter().enumerate() {
+            let second_index = sorted_indices[(sorted_position + 1) % sorted_indices.len()];
+            let start_angle = directions[first_index].2;
+            let mut end_angle = directions[second_index].2;
+            if sorted_position + 1 == sorted_indices.len() {
+                end_angle += TWO_PI;
+            }
+            let separation = end_angle - start_angle;
+            if separation > ANGLE_TOLERANCE && separation < std::f64::consts::PI {
+                pairs.push(LayoutPair {
+                    pair: SpeakerPair2d {
+                        first_index,
+                        second_index,
+                    },
+                    start_angle,
+                    end_angle,
+                });
+            }
+        }
+        if pairs.is_empty() {
+            return Err(RenderError::NoUsableSpeakerPair);
+        }
+
+        Ok(Self {
+            speakers,
+            directions,
+            sorted_indices,
+            pairs,
+        })
+    }
+
+    /// Returns the caller-declared speaker/output order.
+    #[must_use]
+    pub fn speakers(&self) -> &[Speaker2d] {
+        &self.speakers
+    }
+
+    /// Returns the number of public output planes.
+    #[must_use]
+    pub fn speaker_count(&self) -> usize {
+        self.speakers.len()
+    }
+
+    /// Returns the deterministic pair and gains for one explicit position.
+    pub fn pair_gains(&self, position: CartesianPosition) -> Result<PairGains2d, RenderError> {
+        validate_position(position)?;
+        let (x, y, theta) = normalized_horizontal(position)?;
+
+        for (index, &(_, _, speaker_angle)) in self.directions.iter().enumerate() {
+            if angular_distance(theta, speaker_angle) <= ANGLE_TOLERANCE {
+                return Ok(PairGains2d {
+                    pair: SpeakerPair2d {
+                        first_index: index,
+                        second_index: index,
+                    },
+                    first: 1.0,
+                    second: 0.0,
+                });
+            }
+        }
+
+        let mut selected = None;
+        let mut normalized_theta = theta;
+        if normalized_theta < self.pairs[0].start_angle {
+            normalized_theta += TWO_PI;
+        }
+        for candidate in &self.pairs {
+            let mut candidate_theta = normalized_theta;
+            let start = candidate.start_angle;
+            let mut end = candidate.end_angle;
+            if end < start {
+                end += TWO_PI;
+            }
+            if candidate_theta < start {
+                candidate_theta += TWO_PI;
+            }
+            if candidate_theta >= start - ANGLE_TOLERANCE
+                && candidate_theta <= end + ANGLE_TOLERANCE
+                && selected.replace(*candidate).is_some()
+            {
+                return Err(RenderError::AmbiguousSpeakerPair);
+            }
+        }
+        let candidate = selected.ok_or(RenderError::UnsupportedDirection { angle: theta })?;
+        let first = self.directions[candidate.pair.first_index];
+        let second = self.directions[candidate.pair.second_index];
+        let determinant = first.0.mul_add(second.1, -(second.0 * first.1));
+        if determinant.abs() <= DETERMINANT_TOLERANCE || !determinant.is_finite() {
+            return Err(RenderError::SingularSpeakerPair {
+                first: candidate.pair.first_index,
+                second: candidate.pair.second_index,
+            });
+        }
+        let mut first_gain = (x.mul_add(second.1, -(second.0 * y))) / determinant;
+        let mut second_gain = (first.0.mul_add(y, -(x * first.1))) / determinant;
+        if !first_gain.is_finite() || !second_gain.is_finite() {
+            return Err(RenderError::InvalidPairGains);
+        }
+        if first_gain < -GAIN_TOLERANCE || second_gain < -GAIN_TOLERANCE {
+            return Err(RenderError::NegativePairGain);
+        }
+        if first_gain < 0.0 {
+            first_gain = 0.0;
+        }
+        if second_gain < 0.0 {
+            second_gain = 0.0;
+        }
+        let norm = first_gain
+            .mul_add(first_gain, second_gain * second_gain)
+            .sqrt();
+        if !norm.is_finite() || norm <= DETERMINANT_TOLERANCE {
+            return Err(RenderError::InvalidPairGains);
+        }
+        Ok(PairGains2d {
+            pair: candidate.pair,
+            first: first_gain / norm,
+            second: second_gain / norm,
+        })
+    }
+
+    /// Returns the deterministic internally sorted public speaker indices.
+    #[must_use]
+    pub fn sorted_indices(&self) -> &[usize] {
+        &self.sorted_indices
+    }
+}
+
+/// Stateless block renderer for explicit sources and an arbitrary 2D layout.
+#[derive(Clone, Debug)]
+pub struct LayoutRenderer2d {
+    layout: SpeakerLayout2d,
+}
+
+impl LayoutRenderer2d {
+    /// Creates a renderer for a validated speaker layout.
+    #[must_use]
+    pub fn new(layout: SpeakerLayout2d) -> Self {
+        Self { layout }
+    }
+
+    /// Returns the immutable speaker layout and public output order.
+    #[must_use]
+    pub const fn layout(&self) -> &SpeakerLayout2d {
+        &self.layout
+    }
+
+    /// Renders one static-position block into caller-owned planar outputs.
+    ///
+    /// `outputs` must have one reusable plane per declared speaker, in the
+    /// exact order supplied to [`SpeakerLayout2d::new`]. The renderer clears
+    /// all planes on success, performs no truncation/padding, and does not
+    /// allocate per sample. Output is unclipped `f64`; no LFE routing,
+    /// distance model, or bass management is applied.
+    pub fn render_block(
+        &self,
+        sources: &[ExplicitSpatialSource<'_>],
+        outputs: &mut [&mut [f64]],
+    ) -> Result<(), RenderError> {
+        if outputs.len() != self.layout.speakers.len() {
+            return Err(RenderError::SpeakerOutputCountMismatch {
+                expected: self.layout.speakers.len(),
+                actual: outputs.len(),
+            });
+        }
+        let block_length = outputs.first().map_or(0, |output| output.len());
+        for (index, output) in outputs.iter().enumerate() {
+            if output.len() != block_length {
+                return Err(RenderError::SpeakerOutputLengthMismatch {
+                    speaker_index: index,
+                    expected: block_length,
+                    actual: output.len(),
+                });
+            }
+        }
+        for source in sources {
+            if source.samples.len() != block_length {
+                return Err(RenderError::SourceBlockLengthMismatch {
+                    id: source.id,
+                    expected: block_length,
+                    actual: source.samples.len(),
+                });
+            }
+            validate_position(source.position)?;
+            validate_gain(source.gain)?;
+            if let Some(sample_index) = source.samples.iter().position(|sample| !sample.is_finite())
+            {
+                return Err(RenderError::NonFiniteSourceSample {
+                    id: source.id,
+                    sample_index,
+                });
+            }
+            self.layout.pair_gains(source.position)?;
+        }
+
+        for output in outputs.iter_mut() {
+            output.fill(0.0);
+        }
+        for source in sources {
+            let gains = self.layout.pair_gains(source.position)?;
+            let first_index = gains.pair.first_index;
+            let second_index = gains.pair.second_index;
+            let first_gain = gains.first * source.gain;
+            let second_gain = gains.second * source.gain;
+            for (sample_index, &sample) in source.samples.iter().enumerate() {
+                outputs[first_index][sample_index] += sample * first_gain;
+                if first_index == second_index {
+                    if !outputs[first_index][sample_index].is_finite() {
+                        clear_outputs(outputs);
+                        return Err(RenderError::NonFiniteOutput {
+                            channel: OutputChannel::Speaker(first_index),
+                            sample_index,
+                        });
+                    }
+                } else {
+                    outputs[second_index][sample_index] += sample * second_gain;
+                    if !outputs[first_index][sample_index].is_finite() {
+                        clear_outputs(outputs);
+                        return Err(RenderError::NonFiniteOutput {
+                            channel: OutputChannel::Speaker(first_index),
+                            sample_index,
+                        });
+                    }
+                    if !outputs[second_index][sample_index].is_finite() {
+                        clear_outputs(outputs);
+                        return Err(RenderError::NonFiniteOutput {
+                            channel: OutputChannel::Speaker(second_index),
+                            sample_index,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Renders absolute-sample trajectory blocks into caller-owned outputs.
+    ///
+    /// The trajectory is evaluated for every source sample. All source IDs,
+    /// ranges, states, and panner directions are preflighted before outputs
+    /// are cleared, so structural failures leave caller buffers unchanged.
+    /// Numerical overflow during accumulation clears outputs and returns an
+    /// error; no partially valid result is presented.
+    pub fn render_trajectory_block(
+        &self,
+        sources: &[TrajectorySourceBlock<'_>],
+        outputs: &mut [&mut [f64]],
+    ) -> Result<(), RenderError> {
+        validate_speaker_outputs(self.layout.speakers.len(), outputs)?;
+        let block_length = outputs.first().map_or(0, |output| output.len());
+        validate_trajectory_sources(sources, block_length)?;
+        for source in sources {
+            for offset in 0..block_length {
+                let sample = source
+                    .block_start_sample
+                    .checked_add(offset as u64)
+                    .ok_or(RenderError::SampleIndexOverflow)?;
+                let state = source.trajectory.evaluate(sample)?;
+                self.layout.pair_gains(state.position)?;
+                validate_gain(state.gain)?;
+            }
+        }
+        for output in outputs.iter_mut() {
+            output.fill(0.0);
+        }
+        for source in sources {
+            for (offset, &sample_value) in source.samples.iter().enumerate() {
+                let sample = source.block_start_sample + offset as u64;
+                let state = source.trajectory.evaluate(sample)?;
+                let gains = self.layout.pair_gains(state.position)?;
+                let first = gains.pair.first_index;
+                let second = gains.pair.second_index;
+                let first_gain = gains.first * state.gain;
+                let second_gain = gains.second * state.gain;
+                outputs[first][offset] += sample_value * first_gain;
+                if first != second {
+                    outputs[second][offset] += sample_value * second_gain;
+                }
+                check_speaker_outputs_finite(outputs, offset, first, second)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One caller-declared three-dimensional output speaker direction.
+///
+/// The direction is normalized only for the internal VBAP solve. Speaker
+/// order is never inferred from geometry; it is the output order supplied to
+/// the layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Speaker3d {
+    id: SpeakerId,
+    position: CartesianPosition,
+}
+
+impl Speaker3d {
+    /// Creates a speaker with a finite, nonzero 3D direction.
+    pub fn new(id: SpeakerId, position: CartesianPosition) -> Result<Self, RenderError> {
+        validate_position(position)?;
+        normalized_3d(position)?;
+        Ok(Self { id, position })
+    }
+
+    /// Returns the opaque speaker identity.
+    #[must_use]
+    pub const fn id(self) -> SpeakerId {
+        self.id
+    }
+
+    /// Returns the caller-declared Cartesian direction.
+    #[must_use]
+    pub const fn position(self) -> CartesianPosition {
+        self.position
+    }
+}
+
+/// One explicit 3D VBAP triplet in caller-declared speaker-ID order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpeakerTriplet3d {
+    first: SpeakerId,
+    second: SpeakerId,
+    third: SpeakerId,
+}
+
+impl SpeakerTriplet3d {
+    /// Creates a triplet. The three IDs must be distinct.
+    pub fn new(first: SpeakerId, second: SpeakerId, third: SpeakerId) -> Result<Self, RenderError> {
+        if first == second || first == third || second == third {
+            return Err(RenderError::DuplicateTripletSpeaker);
+        }
+        Ok(Self {
+            first,
+            second,
+            third,
+        })
+    }
+
+    /// Returns the first declared speaker ID.
+    #[must_use]
+    pub const fn first(self) -> SpeakerId {
+        self.first
+    }
+
+    /// Returns the second declared speaker ID.
+    #[must_use]
+    pub const fn second(self) -> SpeakerId {
+        self.second
+    }
+
+    /// Returns the third declared speaker ID.
+    #[must_use]
+    pub const fn third(self) -> SpeakerId {
+        self.third
+    }
+
+    const fn ids(self) -> [SpeakerId; 3] {
+        [self.first, self.second, self.third]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TripletRecord3d {
+    triplet: SpeakerTriplet3d,
+    indices: [usize; 3],
+    columns: [[f64; 3]; 3],
+}
+
+/// A validated explicit 3D speaker topology.
+///
+/// The caller supplies both the public output order and every admissible
+/// triplet. The layout never constructs Delaunay triangles, a convex hull, or
+/// a “best” triplet implicitly. A direction covered by more than one declared
+/// triplet is accepted only when all resulting public-order gain vectors agree
+/// within the fixed numerical ambiguity tolerance.
+#[derive(Clone, Debug)]
+pub struct SpeakerLayout3d {
+    speakers: Vec<Speaker3d>,
+    directions: Vec<[f64; 3]>,
+    triplets: Vec<TripletRecord3d>,
+    declared_triplets: Vec<SpeakerTriplet3d>,
+}
+
+impl SpeakerLayout3d {
+    /// Builds an immutable topology from caller-declared speakers and triplets.
+    pub fn new(
+        speakers: Vec<Speaker3d>,
+        triplets: Vec<SpeakerTriplet3d>,
+    ) -> Result<Self, RenderError> {
+        if speakers.len() < 3 {
+            return Err(RenderError::TooFew3dSpeakers {
+                actual: speakers.len(),
+            });
+        }
+        for (index, speaker) in speakers.iter().enumerate() {
+            if speakers[index + 1..]
+                .iter()
+                .any(|other| other.id == speaker.id)
+            {
+                return Err(RenderError::DuplicateSpeakerId { id: speaker.id });
+            }
+        }
+        let directions: Vec<_> = speakers
+            .iter()
+            .map(|speaker| normalized_3d(speaker.position))
+            .collect::<Result<_, _>>()?;
+        for first in 0..directions.len() {
+            for second in first + 1..directions.len() {
+                if direction_distance_squared(directions[first], directions[second])
+                    <= DIRECTION_TOLERANCE * DIRECTION_TOLERANCE
+                {
+                    return Err(RenderError::DuplicateSpeakerDirection { first, second });
+                }
+            }
+        }
+
+        let mut records = Vec::with_capacity(triplets.len());
+        for triplet in triplets {
+            let ids = triplet.ids();
+            let mut indices = [0_usize; 3];
+            for (slot, id) in ids.into_iter().enumerate() {
+                indices[slot] = speakers
+                    .iter()
+                    .position(|speaker| speaker.id == id)
+                    .ok_or(RenderError::MissingTripletSpeaker { id })?;
+            }
+            let mut canonical = indices;
+            canonical.sort_unstable();
+            if records.iter().any(|record: &TripletRecord3d| {
+                let mut prior = record.indices;
+                prior.sort_unstable();
+                prior == canonical
+            }) {
+                return Err(RenderError::DuplicateTriplet);
+            }
+            let columns = [
+                directions[indices[0]],
+                directions[indices[1]],
+                directions[indices[2]],
+            ];
+            let determinant = determinant3(columns);
+            if !determinant.is_finite() || determinant.abs() <= DETERMINANT_TOLERANCE {
+                return Err(RenderError::DegenerateTriplet { indices });
+            }
+            records.push(TripletRecord3d {
+                triplet,
+                indices,
+                columns,
+            });
+        }
+        if records.is_empty() {
+            return Err(RenderError::NoDeclared3dTriplet);
+        }
+        Ok(Self {
+            speakers,
+            directions,
+            declared_triplets: records.iter().map(|record| record.triplet).collect(),
+            triplets: records,
+        })
+    }
+
+    /// Returns the caller-declared public output order.
+    #[must_use]
+    pub fn speakers(&self) -> &[Speaker3d] {
+        &self.speakers
+    }
+
+    /// Returns the number of public output speakers.
+    #[must_use]
+    pub fn speaker_count(&self) -> usize {
+        self.speakers.len()
+    }
+
+    /// Returns the number of explicitly declared candidate triplets.
+    #[must_use]
+    pub fn triplet_count(&self) -> usize {
+        self.triplets.len()
+    }
+
+    /// Returns the caller-declared triplets in declaration order.
+    #[must_use]
+    pub fn triplets(&self) -> &[SpeakerTriplet3d] {
+        &self.declared_triplets
+    }
+
+    /// Resolves one position to deterministic energy-normalized triplet gains.
+    pub fn gains(&self, position: CartesianPosition) -> Result<TripletGains3d, RenderError> {
+        validate_position(position)?;
+        let direction = normalized_3d(position)?;
+        for (index, &speaker_direction) in self.directions.iter().enumerate() {
+            if direction_distance_squared(direction, speaker_direction)
+                <= DIRECTION_TOLERANCE * DIRECTION_TOLERANCE
+            {
+                return Ok(TripletGains3d {
+                    triplet: None,
+                    indices: [index, index, index],
+                    gains: [1.0, 0.0, 0.0],
+                    exact_index: Some(index),
+                    speaker_count: self.speakers.len(),
+                });
+            }
+        }
+
+        let mut selected: Option<([usize; 3], [f64; 3], SpeakerTriplet3d)> = None;
+        for record in &self.triplets {
+            let mut gains = solve_3x3_for(record.columns, direction)?;
+            if gains.iter().any(|gain| *gain < -GAIN_TOLERANCE) {
+                continue;
+            }
+            for gain in &mut gains {
+                if *gain < 0.0 {
+                    *gain = 0.0;
+                }
+            }
+            let norm = gains.iter().fold(0.0, |sum, gain| sum + gain * gain).sqrt();
+            if !norm.is_finite() || norm <= DETERMINANT_TOLERANCE {
+                continue;
+            }
+            for gain in &mut gains {
+                *gain /= norm;
+            }
+            if let Some((prior_indices, prior_gains, _)) = selected {
+                for speaker_index in 0..self.speakers.len() {
+                    let prior = gain_at(prior_indices, prior_gains, speaker_index);
+                    let current = gain_at(record.indices, gains, speaker_index);
+                    if (prior - current).abs() > AMBIGUITY_TOLERANCE {
+                        return Err(RenderError::Ambiguous3dCoverage);
+                    }
+                }
+            } else {
+                selected = Some((record.indices, gains, record.triplet));
+            }
+        }
+        let (indices, gains, triplet) = selected.ok_or(RenderError::Unsupported3dDirection {
+            x: direction[0],
+            y: direction[1],
+            z: direction[2],
+        })?;
+        Ok(TripletGains3d {
+            triplet: Some(triplet),
+            indices,
+            gains,
+            exact_index: None,
+            speaker_count: self.speakers.len(),
+        })
+    }
+
+    fn gains_into(
+        &self,
+        position: CartesianPosition,
+        output: &mut [f64],
+    ) -> Result<(), RenderError> {
+        self.gains(position)?.write_full_gains(output)
+    }
+}
+
+/// Energy-normalized gains for one explicit 3D triplet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TripletGains3d {
+    triplet: Option<SpeakerTriplet3d>,
+    indices: [usize; 3],
+    gains: [f64; 3],
+    exact_index: Option<usize>,
+    speaker_count: usize,
+}
+
+impl TripletGains3d {
+    /// Returns the declared triplet, or `None` for an exact one-speaker hit.
+    #[must_use]
+    pub const fn triplet(self) -> Option<SpeakerTriplet3d> {
+        self.triplet
+    }
+
+    /// Returns the three gains in declared triplet order.
+    #[must_use]
+    pub const fn gains(self) -> [f64; 3] {
+        self.gains
+    }
+
+    /// Returns the first triplet gain.
+    #[must_use]
+    pub const fn first(self) -> f64 {
+        self.gains[0]
+    }
+
+    /// Returns the second triplet gain.
+    #[must_use]
+    pub const fn second(self) -> f64 {
+        self.gains[1]
+    }
+
+    /// Returns the third triplet gain.
+    #[must_use]
+    pub const fn third(self) -> f64 {
+        self.gains[2]
+    }
+
+    /// Expands gains into the layout's caller-declared output order.
+    pub fn write_full_gains(self, output: &mut [f64]) -> Result<(), RenderError> {
+        if output.len() != self.speaker_count {
+            return Err(RenderError::SpeakerOutputCountMismatch {
+                expected: self.speaker_count,
+                actual: output.len(),
+            });
+        }
+        output.fill(0.0);
+        if let Some(index) = self.exact_index {
+            output[index] = 1.0;
+        } else {
+            for (index, gain) in self.indices.into_iter().zip(self.gains) {
+                output[index] = gain;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stateless block renderer for an explicit 3D speaker topology.
+#[derive(Clone, Debug)]
+pub struct LayoutRenderer3d {
+    layout: SpeakerLayout3d,
+}
+
+impl LayoutRenderer3d {
+    /// Creates a renderer for a validated explicit 3D topology.
+    #[must_use]
+    pub fn new(layout: SpeakerLayout3d) -> Self {
+        Self { layout }
+    }
+
+    /// Returns the immutable explicit topology.
+    #[must_use]
+    pub const fn layout(&self) -> &SpeakerLayout3d {
+        &self.layout
+    }
+
+    /// Renders static explicit sources into caller-owned planar outputs.
+    ///
+    /// All structure, source data, and 3D gain resolution are preflighted
+    /// before outputs are cleared. Mixing uses one reusable speaker-gain
+    /// scratch vector per call and never allocates per sample or per source
+    /// sample. A numeric failure clears all outputs.
+    pub fn render_block(
+        &self,
+        sources: &[ExplicitSpatialSource<'_>],
+        outputs: &mut [&mut [f64]],
+    ) -> Result<(), RenderError> {
+        validate_speaker_outputs(self.layout.speaker_count(), outputs)?;
+        let block_length = outputs.first().map_or(0, |output| output.len());
+        for (index, source) in sources.iter().enumerate() {
+            if sources[index + 1..]
+                .iter()
+                .any(|other| other.id == source.id)
+            {
+                return Err(RenderError::DuplicateSourceId { id: source.id });
+            }
+            if source.samples.len() != block_length {
+                return Err(RenderError::SourceBlockLengthMismatch {
+                    id: source.id,
+                    expected: block_length,
+                    actual: source.samples.len(),
+                });
+            }
+            validate_position(source.position)?;
+            validate_gain(source.gain)?;
+            if let Some(sample_index) = source.samples.iter().position(|sample| !sample.is_finite())
+            {
+                return Err(RenderError::NonFiniteSourceSample {
+                    id: source.id,
+                    sample_index,
+                });
+            }
+            self.layout.gains(source.position)?;
+        }
+
+        for output in outputs.iter_mut() {
+            output.fill(0.0);
+        }
+        let mut full_gains = vec![0.0; self.layout.speaker_count()];
+        for source in sources {
+            self.layout.gains_into(source.position, &mut full_gains)?;
+            for (sample_index, &sample) in source.samples.iter().enumerate() {
+                for (speaker_index, output) in outputs.iter_mut().enumerate() {
+                    output[sample_index] += sample * source.gain * full_gains[speaker_index];
+                    if !output[sample_index].is_finite() {
+                        clear_outputs(outputs);
+                        return Err(RenderError::NonFiniteOutput {
+                            channel: OutputChannel::Speaker(speaker_index),
+                            sample_index,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Renders sample-accurate 3D trajectory blocks into caller-owned outputs.
+    ///
+    /// Every sample is evaluated from its absolute trajectory index using the
+    /// immutable explicit triplet topology. A complete preflight is performed
+    /// before outputs are cleared, so unsupported directions, ambiguous
+    /// overlaps, invalid timelines, and duplicate source IDs leave caller
+    /// buffers unchanged. Numeric overflow during accumulation clears outputs
+    /// and returns an error.
+    pub fn render_trajectory_block(
+        &self,
+        sources: &[TrajectorySourceBlock3d<'_>],
+        outputs: &mut [&mut [f64]],
+    ) -> Result<(), RenderError> {
+        validate_speaker_outputs(self.layout.speaker_count(), outputs)?;
+        let block_length = outputs.first().map_or(0, |output| output.len());
+        validate_trajectory_sources_3d(sources, block_length)?;
+        for source in sources {
+            for offset in 0..block_length {
+                let sample = source
+                    .block_start_sample
+                    .checked_add(offset as u64)
+                    .ok_or(RenderError::SampleIndexOverflow)?;
+                let state = source.trajectory.evaluate(sample)?;
+                self.layout.gains(state.position())?;
+                validate_gain(state.gain())?;
+            }
+        }
+
+        for output in outputs.iter_mut() {
+            output.fill(0.0);
+        }
+        let mut full_gains = vec![0.0; self.layout.speaker_count()];
+        for source in sources {
+            for (offset, &sample_value) in source.samples.iter().enumerate() {
+                let sample = source
+                    .block_start_sample
+                    .checked_add(offset as u64)
+                    .ok_or(RenderError::SampleIndexOverflow)?;
+                let state = source.trajectory.evaluate(sample)?;
+                self.layout.gains_into(state.position(), &mut full_gains)?;
+                for (speaker_index, output) in outputs.iter_mut().enumerate() {
+                    output[offset] += sample_value * state.gain() * full_gains[speaker_index];
+                    if !output[offset].is_finite() {
+                        clear_outputs(outputs);
+                        return Err(RenderError::NonFiniteOutput {
+                            channel: OutputChannel::Speaker(speaker_index),
+                            sample_index: offset,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn normalized_3d(position: CartesianPosition) -> Result<[f64; 3], RenderError> {
+    validate_position(position)?;
+    let norm = position
+        .x
+        .mul_add(
+            position.x,
+            position.y.mul_add(position.y, position.z * position.z),
+        )
+        .sqrt();
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err(RenderError::Undefined3dSpeakerDirection);
+    }
+    Ok([position.x / norm, position.y / norm, position.z / norm])
+}
+
+fn same_direction_3d(first: [f64; 3], second: [f64; 3]) -> bool {
+    let dot = first
+        .iter()
+        .zip(second)
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    (1.0 - dot).abs() <= HRIR_DIRECTION_DOT_TOLERANCE
+}
+
+const HRIR_DIRECTION_GRID_SCALE: f64 = 1_000_000.0;
+
+fn hrir_direction_cell(direction: [f64; 3]) -> [i64; 3] {
+    direction.map(|value| (value * HRIR_DIRECTION_GRID_SCALE).floor() as i64)
+}
+
+fn validate_binaural_outputs(left: &[f64], right: &[f64]) -> Result<(), RenderError> {
+    if left.len() != right.len() {
+        return Err(RenderError::BinauralOutputLengthMismatch {
+            left: left.len(),
+            right: right.len(),
+        });
+    }
+    if slices_overlap(left, right) {
+        return Err(RenderError::BinauralOutputAliased);
+    }
+    Ok(())
+}
+
+fn slices_overlap(first: &[f64], second: &[f64]) -> bool {
+    if first.is_empty() || second.is_empty() {
+        return false;
+    }
+    let first_start = first.as_ptr() as usize;
+    let second_start = second.as_ptr() as usize;
+    let first_bytes = first.len().saturating_mul(std::mem::size_of::<f64>());
+    let second_bytes = second.len().saturating_mul(std::mem::size_of::<f64>());
+    let first_end = first_start.saturating_add(first_bytes);
+    let second_end = second_start.saturating_add(second_bytes);
+    first_start < second_end && second_start < first_end
+}
+
+fn update_binaural_history(history: &mut [f64], block: &[f64], gain: f64) {
+    if history.is_empty() {
+        return;
+    }
+    if block.len() >= history.len() {
+        let first = block.len() - history.len();
+        for (slot, &sample) in history.iter_mut().zip(&block[first..]) {
+            *slot = sample * gain;
+        }
+    } else {
+        let shift = block.len();
+        history.copy_within(shift.., 0);
+        let start = history.len() - shift;
+        for (slot, &sample) in history[start..].iter_mut().zip(block) {
+            *slot = sample * gain;
+        }
+    }
+}
+
+fn normalize_direction_3d(direction: [f64; 3]) -> Result<[f64; 3], RenderError> {
+    let norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err(RenderError::Invalid3dTrajectoryState);
+    }
+    Ok([
+        direction[0] / norm,
+        direction[1] / norm,
+        direction[2] / norm,
+    ])
+}
+
+fn great_circle_direction(start: [f64; 3], end: [f64; 3], t: f64) -> Result<[f64; 3], RenderError> {
+    if !t.is_finite() || !(0.0..=1.0).contains(&t) {
+        return Err(RenderError::Invalid3dTrajectoryState);
+    }
+    let dot = start
+        .iter()
+        .zip(end)
+        .map(|(left, right)| left * right)
+        .sum::<f64>()
+        .clamp(-1.0, 1.0);
+    let omega = dot.acos();
+    if !omega.is_finite() {
+        return Err(RenderError::Invalid3dTrajectoryState);
+    }
+    if std::f64::consts::PI - omega <= ANTIPODAL_3D_TOLERANCE {
+        return Err(RenderError::AmbiguousAntipodal3dPath);
+    }
+    if omega <= SMALL_ANGLE_3D_TOLERANCE {
+        return normalize_direction_3d([
+            start[0].mul_add(1.0 - t, end[0] * t),
+            start[1].mul_add(1.0 - t, end[1] * t),
+            start[2].mul_add(1.0 - t, end[2] * t),
+        ]);
+    }
+    let sin_omega = omega.sin();
+    if !sin_omega.is_finite() || sin_omega.abs() <= f64::MIN_POSITIVE {
+        return Err(RenderError::Invalid3dTrajectoryState);
+    }
+    let first_weight = ((1.0 - t) * omega).sin() / sin_omega;
+    let second_weight = (t * omega).sin() / sin_omega;
+    normalize_direction_3d([
+        start[0].mul_add(first_weight, end[0] * second_weight),
+        start[1].mul_add(first_weight, end[1] * second_weight),
+        start[2].mul_add(first_weight, end[2] * second_weight),
+    ])
+}
+
+fn trajectory_states_match_3d(first: SpatialState3d, second: SpatialState3d) -> bool {
+    first
+        .direction
+        .iter()
+        .zip(second.direction)
+        .all(|(left, right)| (left - right).abs() <= TRAJECTORY_3D_STATE_TOLERANCE)
+        && (first.gain - second.gain).abs() <= TRAJECTORY_3D_STATE_TOLERANCE
+}
+
+fn direction_distance_squared(first: [f64; 3], second: [f64; 3]) -> f64 {
+    let dx = first[0] - second[0];
+    let dy = first[1] - second[1];
+    let dz = first[2] - second[2];
+    dx.mul_add(dx, dy.mul_add(dy, dz * dz))
+}
+
+fn determinant3(columns: [[f64; 3]; 3]) -> f64 {
+    let [a, b, c] = columns;
+    a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+        + a[2] * (b[0] * c[1] - b[1] * c[0])
+}
+
+fn solve_3x3_for(columns: [[f64; 3]; 3], vector: [f64; 3]) -> Result<[f64; 3], RenderError> {
+    let determinant = determinant3(columns);
+    if !determinant.is_finite() || determinant.abs() <= DETERMINANT_TOLERANCE {
+        return Err(RenderError::Invalid3dGains);
+    }
+    let mut first = columns;
+    first[0] = vector;
+    let mut second = columns;
+    second[1] = vector;
+    let mut third = columns;
+    third[2] = vector;
+    let result = [
+        determinant3(first) / determinant,
+        determinant3(second) / determinant,
+        determinant3(third) / determinant,
+    ];
+    if result.iter().all(|gain| gain.is_finite()) {
+        Ok(result)
+    } else {
+        Err(RenderError::Invalid3dGains)
+    }
+}
+
+fn gain_at(indices: [usize; 3], gains: [f64; 3], index: usize) -> f64 {
+    indices
+        .into_iter()
+        .zip(gains)
+        .find_map(|(candidate, gain)| (candidate == index).then_some(gain))
+        .unwrap_or(0.0)
+}
+
+const ANGLE_TOLERANCE: f64 = 1.0e-12;
+const DETERMINANT_TOLERANCE: f64 = 1.0e-12;
+const GAIN_TOLERANCE: f64 = 1.0e-12;
+const DIRECTION_TOLERANCE: f64 = 1.0e-12;
+const AMBIGUITY_TOLERANCE: f64 = 1.0e-10;
+const SMALL_ANGLE_3D_TOLERANCE: f64 = 1.0e-8;
+const ANTIPODAL_3D_TOLERANCE: f64 = 1.0e-10;
+const TRAJECTORY_3D_STATE_TOLERANCE: f64 = 1.0e-12;
+const HRIR_DIRECTION_DOT_TOLERANCE: f64 = 1.0e-12;
+const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
+const MAX_EXACT_INTERPOLATION_SPAN: u64 = 1_u64 << 53;
+
+fn clear_outputs(outputs: &mut [&mut [f64]]) {
+    for output in outputs.iter_mut() {
+        output.fill(0.0);
+    }
+}
+
+fn validate_speaker_outputs(expected: usize, outputs: &[&mut [f64]]) -> Result<(), RenderError> {
+    if outputs.len() != expected {
+        return Err(RenderError::SpeakerOutputCountMismatch {
+            expected,
+            actual: outputs.len(),
+        });
+    }
+    let block_length = outputs.first().map_or(0, |output| output.len());
+    for (speaker_index, output) in outputs.iter().enumerate() {
+        if output.len() != block_length {
+            return Err(RenderError::SpeakerOutputLengthMismatch {
+                speaker_index,
+                expected: block_length,
+                actual: output.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_trajectory_sources(
+    sources: &[TrajectorySourceBlock<'_>],
+    block_length: usize,
+) -> Result<(), RenderError> {
+    for (index, source) in sources.iter().enumerate() {
+        if sources[index + 1..]
+            .iter()
+            .any(|other| other.id == source.id)
+        {
+            return Err(RenderError::DuplicateSourceId { id: source.id });
+        }
+        if source.samples.len() != block_length {
+            return Err(RenderError::SourceBlockLengthMismatch {
+                id: source.id,
+                expected: block_length,
+                actual: source.samples.len(),
+            });
+        }
+        source
+            .trajectory
+            .validate_block(source.block_start_sample, block_length)?;
+    }
+    Ok(())
+}
+
+fn validate_trajectory_sources_3d(
+    sources: &[TrajectorySourceBlock3d<'_>],
+    block_length: usize,
+) -> Result<(), RenderError> {
+    for (index, source) in sources.iter().enumerate() {
+        if sources[index + 1..]
+            .iter()
+            .any(|other| other.id == source.id)
+        {
+            return Err(RenderError::DuplicateSourceId { id: source.id });
+        }
+        if source.samples.len() != block_length {
+            return Err(RenderError::SourceBlockLengthMismatch {
+                id: source.id,
+                expected: block_length,
+                actual: source.samples.len(),
+            });
+        }
+        if let Some(sample_index) = source.samples.iter().position(|sample| !sample.is_finite()) {
+            return Err(RenderError::NonFiniteSourceSample {
+                id: source.id,
+                sample_index,
+            });
+        }
+        source
+            .trajectory
+            .validate_block(source.block_start_sample, block_length)?;
+    }
+    Ok(())
+}
+
+fn check_speaker_outputs_finite(
+    outputs: &mut [&mut [f64]],
+    sample_index: usize,
+    first: usize,
+    second: usize,
+) -> Result<(), RenderError> {
+    if !outputs[first][sample_index].is_finite() {
+        clear_outputs(outputs);
+        return Err(RenderError::NonFiniteOutput {
+            channel: OutputChannel::Speaker(first),
+            sample_index,
+        });
+    }
+    if first != second && !outputs[second][sample_index].is_finite() {
+        clear_outputs(outputs);
+        return Err(RenderError::NonFiniteOutput {
+            channel: OutputChannel::Speaker(second),
+            sample_index,
+        });
+    }
+    Ok(())
+}
+
+fn horizontal_magnitude_squared(position: CartesianPosition) -> f64 {
+    position.x.mul_add(position.x, position.y * position.y)
+}
+
+fn normalize_azimuth(mut angle: f64) -> f64 {
+    while angle >= std::f64::consts::PI {
+        angle -= TWO_PI;
+    }
+    while angle < -std::f64::consts::PI {
+        angle += TWO_PI;
+    }
+    angle
+}
+
+fn normalized_horizontal(position: CartesianPosition) -> Result<(f64, f64, f64), RenderError> {
+    validate_position(position)?;
+    let magnitude = horizontal_magnitude_squared(position).sqrt();
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return Err(RenderError::UndefinedHorizontalDirection);
+    }
+    let x = position.x / magnitude;
+    let y = position.y / magnitude;
+    let theta = normalize_azimuth(position.x.atan2(position.y));
+    Ok((x, y, theta))
+}
+
+fn angular_distance(first: f64, second: f64) -> f64 {
+    normalize_azimuth(first - second).abs()
+}
+
+fn azimuth(position: CartesianPosition) -> Result<f64, RenderError> {
+    let (_, _, angle) = normalized_horizontal(position)?;
+    Ok(angle)
+}
+
+fn azimuth_delta(start: f64, end: f64, path: AzimuthPath2d) -> Result<f64, RenderError> {
+    let shortest = normalize_azimuth(end - start);
+    match path {
+        AzimuthPath2d::Shortest => {
+            if (shortest.abs() - std::f64::consts::PI).abs() <= ANGLE_TOLERANCE {
+                return Err(RenderError::AmbiguousAntipodalPath);
+            }
+            Ok(shortest)
+        }
+        AzimuthPath2d::Increasing => {
+            let mut delta = end - start;
+            while delta < 0.0 {
+                delta += TWO_PI;
+            }
+            while delta >= TWO_PI {
+                delta -= TWO_PI;
+            }
+            Ok(delta)
+        }
+        AzimuthPath2d::Decreasing => {
+            let mut delta = end - start;
+            while delta > 0.0 {
+                delta -= TWO_PI;
+            }
+            while delta <= -TWO_PI {
+                delta += TWO_PI;
+            }
+            Ok(delta)
+        }
+    }
+}
+
+impl StereoGains {
+    /// Computes front-horizontal equal-power gains for a position.
+    pub fn for_position(position: CartesianPosition) -> Result<Self, RenderError> {
+        validate_position(position)?;
+        if position.y < 0.0 {
+            return Err(RenderError::RearHemisphereUnsupported { y: position.y });
+        }
+        if position.x == 0.0 && position.y == 0.0 {
+            return Err(RenderError::UndefinedHorizontalDirection);
+        }
+        let theta = position.x.atan2(position.y);
+        let u = (theta + std::f64::consts::FRAC_PI_2) / std::f64::consts::PI;
+        Ok(Self {
+            left: (u * std::f64::consts::FRAC_PI_2).cos(),
+            right: (u * std::f64::consts::FRAC_PI_2).sin(),
+        })
+    }
+}
+
+/// Channel selected by a non-finite output error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputChannel {
+    Left,
+    Right,
+    Speaker(usize),
+}
+
+/// Explicit-scene renderer failures.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RenderError {
+    InvalidSampleRate,
+    NonFinitePosition {
+        axis: &'static str,
+        value: f64,
+    },
+    NonFiniteGain {
+        value: f64,
+    },
+    NonFiniteSourceSample {
+        id: SourceId,
+        sample_index: usize,
+    },
+    EmptyHrir,
+    EmptyHrirBank,
+    MismatchedHrirTapLength {
+        left: usize,
+        right: usize,
+    },
+    NonFiniteHrirTap {
+        ear: HrirEar,
+        tap_index: usize,
+    },
+    InvalidHrirDelay {
+        ear: HrirEar,
+        delay: usize,
+        tap_count: usize,
+    },
+    HrirSampleRateMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    DuplicateHrirDirection {
+        first: usize,
+        second: usize,
+    },
+    DuplicateHrirEntryId {
+        id: HrirEntryId,
+    },
+    UnsupportedHrirDirection {
+        x: f64,
+        y: f64,
+        z: f64,
+    },
+    AmbiguousHrirDirection {
+        first: usize,
+        second: usize,
+    },
+    UnknownHrirEntry {
+        id: HrirEntryId,
+    },
+    HrirEntryDirectionMismatch {
+        source: SourceId,
+        entry: HrirEntryId,
+    },
+    HrirStateSizeOverflow,
+    InvalidPartitionSize {
+        size: usize,
+    },
+    PartitionFftSizeOverflow,
+    PartitionStateSizeOverflow,
+    PartitionedInputAfterFinish,
+    PartitionedRequiresReset,
+    PartitionedAlreadyFinished,
+    PartitionedInputLengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    PartitionedTailOutputLengthMismatch {
+        requested: usize,
+        remaining: usize,
+    },
+    EmptyBinauralSourceSet,
+    BinauralResourceIdentityMismatch,
+    BinauralUpdateEpochMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    BinauralUpdateSequenceNotIncreasing {
+        previous: u64,
+        actual: u64,
+    },
+    BinauralOrientationNotEnabled,
+    BinauralUpdateSourceCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    BinauralUpdateSourceMismatch {
+        position: usize,
+        expected: SourceId,
+        actual: SourceId,
+    },
+    BinauralUpdateTapLimitExceeded {
+        id: SourceId,
+        actual: usize,
+        maximum: usize,
+    },
+    BinauralInvalidTransitionLength,
+    BinauralInvalidBlockLimit,
+    BinauralBlockLimitExceeded {
+        actual: usize,
+        maximum: usize,
+    },
+    BinauralDynamicResourceLimit,
+    BinauralStreamEpochOverflow,
+    BinauralSourceCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    UnknownBinauralSource {
+        id: SourceId,
+    },
+    MissingBinauralSource {
+        id: SourceId,
+    },
+    DuplicateBinauralSource {
+        id: SourceId,
+    },
+    BinauralOutputLengthMismatch {
+        left: usize,
+        right: usize,
+    },
+    BinauralOutputAliased,
+    BinauralInputAfterTailStart,
+    BinauralRequiresReset,
+    BinauralAlreadyFinished,
+    TailOutputLengthMismatch {
+        requested: usize,
+        remaining: usize,
+    },
+    UndefinedHorizontalDirection,
+    RearHemisphereUnsupported {
+        y: f64,
+    },
+    DuplicateSourceId {
+        id: SourceId,
+    },
+    StereoOutputLengthMismatch {
+        left: usize,
+        right: usize,
+    },
+    SourceBlockLengthMismatch {
+        id: SourceId,
+        expected: usize,
+        actual: usize,
+    },
+    NonFiniteOutput {
+        channel: OutputChannel,
+        sample_index: usize,
+    },
+    TooFewSpeakers {
+        actual: usize,
+    },
+    UndefinedSpeakerDirection {
+        id: SpeakerId,
+    },
+    Undefined3dSpeakerDirection,
+    DuplicateSpeakerId {
+        id: SpeakerId,
+    },
+    TooFew3dSpeakers {
+        actual: usize,
+    },
+    DuplicateSpeakerDirection {
+        first: usize,
+        second: usize,
+    },
+    DuplicateTripletSpeaker,
+    MissingTripletSpeaker {
+        id: SpeakerId,
+    },
+    DuplicateTriplet,
+    DegenerateTriplet {
+        indices: [usize; 3],
+    },
+    NoDeclared3dTriplet,
+    Invalid3dGains,
+    Ambiguous3dCoverage,
+    Unsupported3dDirection {
+        x: f64,
+        y: f64,
+        z: f64,
+    },
+    DuplicateSpeakerAzimuth {
+        first: usize,
+        second: usize,
+    },
+    NoUsableSpeakerPair,
+    SingularSpeakerPair {
+        first: usize,
+        second: usize,
+    },
+    InvalidPairGains,
+    NegativePairGain,
+    AmbiguousSpeakerPair,
+    UnsupportedDirection {
+        angle: f64,
+    },
+    SpeakerOutputCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    SpeakerOutputLengthMismatch {
+        speaker_index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    EmptyTrajectory,
+    InvalidTrajectorySegment {
+        start_sample: u64,
+        end_sample: u64,
+    },
+    TrajectorySpanTooLarge {
+        span: u64,
+    },
+    InvalidAzimuthPath,
+    AmbiguousAntipodalPath,
+    AmbiguousAntipodal3dPath,
+    NonContiguousTrajectory {
+        previous_end: u64,
+        next_start: u64,
+    },
+    DiscontinuousTrajectory {
+        boundary: u64,
+    },
+    Discontinuous3dTrajectory {
+        boundary: u64,
+    },
+    Invalid3dTrajectoryState,
+    TrajectorySampleOutOfRange {
+        sample: u64,
+    },
+    TrajectoryBlockOutOfRange {
+        start: u64,
+        length: usize,
+        domain_start: u64,
+        domain_end: u64,
+    },
+    SampleIndexOverflow,
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSampleRate => formatter.write_str("sample rate must be non-zero"),
+            Self::NonFinitePosition { axis, value } => {
+                write!(formatter, "position axis {axis} is non-finite: {value}")
+            }
+            Self::NonFiniteGain { value } => {
+                write!(formatter, "source gain is non-finite: {value}")
+            }
+            Self::NonFiniteSourceSample { id, sample_index } => write!(
+                formatter,
+                "source {} contains a non-finite sample at index {sample_index}",
+                id.0
+            ),
+            Self::EmptyHrir => formatter.write_str("HRIR taps must be non-empty"),
+            Self::EmptyHrirBank => formatter.write_str("HRIR bank must contain at least one entry"),
+            Self::MismatchedHrirTapLength { left, right } => write!(
+                formatter,
+                "HRIR ear tap lengths differ: left={left}, right={right}"
+            ),
+            Self::NonFiniteHrirTap { ear, tap_index } => {
+                write!(
+                    formatter,
+                    "{ear:?} HRIR tap is non-finite at index {tap_index}"
+                )
+            }
+            Self::InvalidHrirDelay {
+                ear,
+                delay,
+                tap_count,
+            } => write!(
+                formatter,
+                "{ear:?} HRIR delay {delay} exceeds tap count {tap_count}"
+            ),
+            Self::HrirSampleRateMismatch { expected, actual } => write!(
+                formatter,
+                "HRIR sample rate mismatch: expected {expected}, actual {actual}"
+            ),
+            Self::DuplicateHrirDirection { first, second } => write!(
+                formatter,
+                "HRIR entries {first} and {second} have indistinguishable directions"
+            ),
+            Self::DuplicateHrirEntryId { id } => {
+                write!(formatter, "duplicate HRIR entry ID {}", id.0)
+            }
+            Self::UnsupportedHrirDirection { x, y, z } => {
+                write!(formatter, "no exact HRIR direction matches ({x}, {y}, {z})")
+            }
+            Self::AmbiguousHrirDirection { first, second } => write!(
+                formatter,
+                "HRIR direction matches multiple entries {first} and {second}"
+            ),
+            Self::UnknownHrirEntry { id } => write!(formatter, "unknown HRIR entry ID {}", id.0),
+            Self::HrirEntryDirectionMismatch { source, entry } => write!(
+                formatter,
+                "source {} direction does not match HRIR entry {}",
+                source.0, entry.0
+            ),
+            Self::HrirStateSizeOverflow => formatter.write_str("HRIR state size overflow"),
+            Self::InvalidPartitionSize { size } => {
+                write!(
+                    formatter,
+                    "partition size must be a non-zero power of two: {size}"
+                )
+            }
+            Self::PartitionFftSizeOverflow => formatter.write_str("partition FFT size overflow"),
+            Self::PartitionStateSizeOverflow => {
+                formatter.write_str("partitioned convolution state size overflow")
+            }
+            Self::PartitionedInputAfterFinish => formatter
+                .write_str("partitioned convolution input is unavailable after finalization"),
+            Self::PartitionedRequiresReset => {
+                formatter.write_str("partitioned convolution requires reset after numeric failure")
+            }
+            Self::PartitionedAlreadyFinished => {
+                formatter.write_str("partitioned convolution tail is already finished")
+            }
+            Self::PartitionedInputLengthMismatch { expected, actual } => write!(
+                formatter,
+                "partitioned input length mismatch: expected {expected}, actual {actual}"
+            ),
+            Self::PartitionedTailOutputLengthMismatch {
+                requested,
+                remaining,
+            } => write!(
+                formatter,
+                "partitioned tail output length mismatch: requested {requested}, remaining {remaining}"
+            ),
+            Self::EmptyBinauralSourceSet => {
+                formatter.write_str("binaural renderer requires at least one source")
+            }
+            Self::BinauralResourceIdentityMismatch => formatter.write_str(
+                "prepared binaural update belongs to a different HRTF or layout resource",
+            ),
+            Self::BinauralUpdateEpochMismatch { expected, actual } => write!(
+                formatter,
+                "prepared binaural update epoch mismatch: expected {expected}, actual {actual}"
+            ),
+            Self::BinauralUpdateSequenceNotIncreasing { previous, actual } => write!(
+                formatter,
+                "prepared binaural sequence must increase: previous {previous}, actual {actual}"
+            ),
+            Self::BinauralOrientationNotEnabled => formatter
+                .write_str("listener-orientation rendering was not enabled for this session"),
+            Self::BinauralUpdateSourceCountMismatch { expected, actual } => write!(
+                formatter,
+                "prepared binaural source count mismatch: expected {expected}, actual {actual}"
+            ),
+            Self::BinauralUpdateSourceMismatch {
+                position,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "prepared binaural source at position {position} mismatch: expected {}, actual {}",
+                expected.0, actual.0
+            ),
+            Self::BinauralUpdateTapLimitExceeded {
+                id,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "prepared HRIR for source {} has {actual} taps, exceeding the limit {maximum}",
+                id.0
+            ),
+            Self::BinauralInvalidTransitionLength => {
+                formatter.write_str("binaural transition length must be non-zero")
+            }
+            Self::BinauralInvalidBlockLimit => {
+                formatter.write_str("dynamic binaural block limit must be non-zero")
+            }
+            Self::BinauralBlockLimitExceeded { actual, maximum } => write!(
+                formatter,
+                "dynamic binaural block has {actual} samples, exceeding the limit {maximum}"
+            ),
+            Self::BinauralDynamicResourceLimit => {
+                formatter.write_str("dynamic binaural resource exceeds its explicit limit")
+            }
+            Self::BinauralStreamEpochOverflow => formatter
+                .write_str("dynamic binaural stream epoch overflowed; renderer is fail-closed"),
+            Self::BinauralSourceCountMismatch { expected, actual } => write!(
+                formatter,
+                "binaural source block count mismatch: expected {expected}, actual {actual}"
+            ),
+            Self::UnknownBinauralSource { id } => {
+                write!(formatter, "unknown binaural source ID {}", id.0)
+            }
+            Self::MissingBinauralSource { id } => {
+                write!(formatter, "missing binaural source ID {}", id.0)
+            }
+            Self::DuplicateBinauralSource { id } => {
+                write!(formatter, "duplicate binaural source block ID {}", id.0)
+            }
+            Self::BinauralOutputLengthMismatch { left, right } => write!(
+                formatter,
+                "binaural output lengths differ: left={left}, right={right}"
+            ),
+            Self::BinauralOutputAliased => {
+                formatter.write_str("binaural output planes may not alias")
+            }
+            Self::BinauralInputAfterTailStart => {
+                formatter.write_str("binaural input is unavailable after tail draining begins")
+            }
+            Self::BinauralRequiresReset => {
+                formatter.write_str("binaural renderer requires reset after numeric failure")
+            }
+            Self::BinauralAlreadyFinished => {
+                formatter.write_str("binaural tail is already finished")
+            }
+            Self::TailOutputLengthMismatch {
+                requested,
+                remaining,
+            } => write!(
+                formatter,
+                "tail output request {requested} exceeds remaining tail {remaining}"
+            ),
+            Self::UndefinedHorizontalDirection => {
+                formatter.write_str("horizontal direction is undefined at x=0, y=0")
+            }
+            Self::RearHemisphereUnsupported { y } => {
+                write!(
+                    formatter,
+                    "rear-hemisphere source is unsupported for stereo: y={y}"
+                )
+            }
+            Self::DuplicateSourceId { id } => write!(formatter, "duplicate source ID {}", id.0),
+            Self::StereoOutputLengthMismatch { left, right } => {
+                write!(
+                    formatter,
+                    "stereo output lengths differ: left={left}, right={right}"
+                )
+            }
+            Self::SourceBlockLengthMismatch {
+                id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "source {} has {actual} samples; expected {expected}",
+                id.0
+            ),
+            Self::NonFiniteOutput {
+                channel,
+                sample_index,
+            } => write!(
+                formatter,
+                "rendered {channel:?} output is non-finite at sample {sample_index}"
+            ),
+            Self::TooFewSpeakers { actual } => {
+                write!(
+                    formatter,
+                    "a 2D layout needs at least two speakers; got {actual}"
+                )
+            }
+            Self::UndefinedSpeakerDirection { id } => {
+                write!(
+                    formatter,
+                    "speaker {} has an undefined horizontal direction",
+                    id.0
+                )
+            }
+            Self::Undefined3dSpeakerDirection => {
+                formatter.write_str("3D speaker direction is undefined at zero length")
+            }
+            Self::DuplicateSpeakerId { id } => {
+                write!(formatter, "duplicate speaker ID {}", id.0)
+            }
+            Self::TooFew3dSpeakers { actual } => {
+                write!(
+                    formatter,
+                    "a 3D layout needs at least three speakers; got {actual}"
+                )
+            }
+            Self::DuplicateSpeakerDirection { first, second } => write!(
+                formatter,
+                "3D speakers {first} and {second} have duplicate normalized directions"
+            ),
+            Self::DuplicateTripletSpeaker => {
+                formatter.write_str("a 3D triplet must contain three distinct speaker IDs")
+            }
+            Self::MissingTripletSpeaker { id } => {
+                write!(formatter, "3D triplet references missing speaker {}", id.0)
+            }
+            Self::DuplicateTriplet => {
+                formatter.write_str("3D triplets must be unique ignoring declaration order")
+            }
+            Self::DegenerateTriplet { indices } => write!(
+                formatter,
+                "3D triplet [{}, {}, {}] has a singular speaker matrix",
+                indices[0], indices[1], indices[2]
+            ),
+            Self::NoDeclared3dTriplet => {
+                formatter.write_str("3D layout requires at least one declared triplet")
+            }
+            Self::Invalid3dGains => formatter.write_str("3D VBAP gains are invalid or degenerate"),
+            Self::Ambiguous3dCoverage => {
+                formatter.write_str("multiple declared 3D triplets produce different gains")
+            }
+            Self::Unsupported3dDirection { x, y, z } => write!(
+                formatter,
+                "explicit 3D speaker topology does not cover direction ({x}, {y}, {z})"
+            ),
+            Self::DuplicateSpeakerAzimuth { first, second } => write!(
+                formatter,
+                "speakers {first} and {second} have duplicate azimuths"
+            ),
+            Self::NoUsableSpeakerPair => {
+                formatter.write_str("layout has no usable non-singular adjacent speaker pair")
+            }
+            Self::SingularSpeakerPair { first, second } => write!(
+                formatter,
+                "speaker pair {first}/{second} is singular or opposed"
+            ),
+            Self::InvalidPairGains => formatter.write_str("pair gains are invalid or degenerate"),
+            Self::NegativePairGain => formatter.write_str("source lies outside the selected pair"),
+            Self::AmbiguousSpeakerPair => {
+                formatter.write_str("source direction matches multiple speaker sectors")
+            }
+            Self::UnsupportedDirection { angle } => {
+                write!(formatter, "speaker layout does not cover azimuth {angle}")
+            }
+            Self::SpeakerOutputCountMismatch { expected, actual } => write!(
+                formatter,
+                "speaker output plane count differs: expected {expected}, got {actual}"
+            ),
+            Self::SpeakerOutputLengthMismatch {
+                speaker_index,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "speaker output {speaker_index} has {actual} samples; expected {expected}"
+            ),
+            Self::EmptyTrajectory => formatter.write_str("trajectory must contain a segment"),
+            Self::InvalidTrajectorySegment {
+                start_sample,
+                end_sample,
+            } => write!(
+                formatter,
+                "trajectory segment must have end > start: {start_sample}..={end_sample}"
+            ),
+            Self::TrajectorySpanTooLarge { span } => write!(
+                formatter,
+                "trajectory span {span} exceeds exact f64 interpolation bound"
+            ),
+            Self::InvalidAzimuthPath => formatter.write_str("azimuth path is invalid"),
+            Self::AmbiguousAntipodalPath => {
+                formatter.write_str("shortest azimuth path is ambiguous for antipodal endpoints")
+            }
+            Self::AmbiguousAntipodal3dPath => formatter
+                .write_str("shortest 3D great-circle path is ambiguous for antipodal endpoints"),
+            Self::NonContiguousTrajectory {
+                previous_end,
+                next_start,
+            } => write!(
+                formatter,
+                "trajectory segments are not contiguous: previous end {previous_end}, next start {next_start}"
+            ),
+            Self::DiscontinuousTrajectory { boundary } => write!(
+                formatter,
+                "trajectory keyframe state is discontinuous at sample {boundary}"
+            ),
+            Self::Discontinuous3dTrajectory { boundary } => write!(
+                formatter,
+                "3D trajectory keyframe state is discontinuous at sample {boundary}"
+            ),
+            Self::Invalid3dTrajectoryState => {
+                formatter.write_str("3D trajectory state is invalid or non-finite")
+            }
+            Self::TrajectorySampleOutOfRange { sample } => {
+                write!(
+                    formatter,
+                    "trajectory sample {sample} is outside its domain"
+                )
+            }
+            Self::TrajectoryBlockOutOfRange {
+                start,
+                length,
+                domain_start,
+                domain_end,
+            } => write!(
+                formatter,
+                "trajectory block [{start}, {}) is outside inclusive domain [{domain_start}, {domain_end}]",
+                start.saturating_add(*length as u64)
+            ),
+            Self::SampleIndexOverflow => formatter.write_str("sample-index arithmetic overflowed"),
+        }
+    }
+}
+
+impl std::error::Error for RenderError {}
+
+/// Stateless, block-oriented FL/FR speaker renderer.
+///
+/// The renderer clears caller-provided output buffers for every call, mixes
+/// all supplied sources linearly, and retains no duration-sized PCM or
+/// time-varying state. Consequently a static scene is partition-invariant.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StereoRenderer;
+
+impl StereoRenderer {
+    /// Creates a stateless stereo renderer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Renders one block of explicit mono sources into caller-owned FL/FR buffers.
+    ///
+    /// The output buffers are always cleared first on success. All source blocks
+    /// must have exactly the output length; no truncation or padding occurs.
+    /// Output is unclipped `f64` PCM and can exceed `[-1, 1]` when sources sum.
+    pub fn render_block(
+        &self,
+        sources: &[ExplicitSpatialSource<'_>],
+        left: &mut [f64],
+        right: &mut [f64],
+    ) -> Result<(), RenderError> {
+        if left.len() != right.len() {
+            return Err(RenderError::StereoOutputLengthMismatch {
+                left: left.len(),
+                right: right.len(),
+            });
+        }
+        for source in sources {
+            if source.samples.len() != left.len() {
+                return Err(RenderError::SourceBlockLengthMismatch {
+                    id: source.id,
+                    expected: left.len(),
+                    actual: source.samples.len(),
+                });
+            }
+            // Constructors validate these fields, but keep the render boundary
+            // explicit in case this type gains additional constructors later.
+            validate_position(source.position)?;
+            validate_gain(source.gain)?;
+            StereoGains::for_position(source.position)?;
+        }
+
+        left.fill(0.0);
+        right.fill(0.0);
+        for source in sources {
+            let gains = StereoGains::for_position(source.position)?;
+            let left_gain = gains.left * source.gain;
+            let right_gain = gains.right * source.gain;
+            for (sample_index, &sample) in source.samples.iter().enumerate() {
+                left[sample_index] += sample * left_gain;
+                right[sample_index] += sample * right_gain;
+                if !left[sample_index].is_finite() {
+                    left.fill(0.0);
+                    right.fill(0.0);
+                    return Err(RenderError::NonFiniteOutput {
+                        channel: OutputChannel::Left,
+                        sample_index,
+                    });
+                }
+                if !right[sample_index].is_finite() {
+                    left.fill(0.0);
+                    right.fill(0.0);
+                    return Err(RenderError::NonFiniteOutput {
+                        channel: OutputChannel::Right,
+                        sample_index,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Renders a block from a borrowed explicit scene.
+    pub fn render_scene_block(
+        &self,
+        scene: &ExplicitSpatialScene<'_>,
+        left: &mut [f64],
+        right: &mut [f64],
+    ) -> Result<(), RenderError> {
+        self.render_block(scene.sources, left, right)
+    }
+
+    /// Renders trajectory-bound sources using absolute sample indices.
+    ///
+    /// Every trajectory sample is preflighted through the front-horizontal
+    /// stereo domain before output buffers are cleared. This prevents an
+    /// unsupported rear-path sample from exposing a partially rendered block.
+    pub fn render_trajectory_block(
+        &self,
+        sources: &[TrajectorySourceBlock<'_>],
+        left: &mut [f64],
+        right: &mut [f64],
+    ) -> Result<(), RenderError> {
+        if left.len() != right.len() {
+            return Err(RenderError::StereoOutputLengthMismatch {
+                left: left.len(),
+                right: right.len(),
+            });
+        }
+        validate_trajectory_sources(sources, left.len())?;
+        for source in sources {
+            for offset in 0..left.len() {
+                let sample = source
+                    .block_start_sample
+                    .checked_add(offset as u64)
+                    .ok_or(RenderError::SampleIndexOverflow)?;
+                let state = source.trajectory.evaluate(sample)?;
+                StereoGains::for_position(state.position)?;
+                validate_gain(state.gain)?;
+            }
+        }
+        left.fill(0.0);
+        right.fill(0.0);
+        for source in sources {
+            for (offset, &sample_value) in source.samples.iter().enumerate() {
+                let sample = source.block_start_sample + offset as u64;
+                let state = source.trajectory.evaluate(sample)?;
+                let gains = StereoGains::for_position(state.position)?;
+                let left_gain = gains.left * state.gain;
+                let right_gain = gains.right * state.gain;
+                left[offset] += sample_value * left_gain;
+                right[offset] += sample_value * right_gain;
+                if !left[offset].is_finite() {
+                    left.fill(0.0);
+                    right.fill(0.0);
+                    return Err(RenderError::NonFiniteOutput {
+                        channel: OutputChannel::Left,
+                        sample_index: offset,
+                    });
+                }
+                if !right[offset].is_finite() {
+                    left.fill(0.0);
+                    right.fill(0.0);
+                    return Err(RenderError::NonFiniteOutput {
+                        channel: OutputChannel::Right,
+                        sample_index: offset,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_position(position: CartesianPosition) -> Result<(), RenderError> {
+    for (axis, value) in [("x", position.x), ("y", position.y), ("z", position.z)] {
+        if !value.is_finite() {
+            return Err(RenderError::NonFinitePosition { axis, value });
+        }
+    }
+    Ok(())
+}
+
+fn validate_gain(gain: f64) -> Result<(), RenderError> {
+    if gain.is_finite() {
+        Ok(())
+    } else {
+        Err(RenderError::NonFiniteGain { value: gain })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPSILON: f64 = 1.0e-12;
+    const MAX_PARTITION_INVARIANCE_ULPS: u64 = 2;
+
+    fn ordered_f64_bits(value: f64) -> u64 {
+        let bits = value.to_bits();
+        if bits & (1_u64 << 63) != 0 {
+            !bits
+        } else {
+            bits | (1_u64 << 63)
+        }
+    }
+
+    fn assert_partition_invariant_3d(expected: &[Vec<f64>], actual: &[Vec<f64>]) {
+        assert_eq!(expected.len(), actual.len());
+        for (speaker, (expected_plane, actual_plane)) in expected.iter().zip(actual).enumerate() {
+            assert_eq!(expected_plane.len(), actual_plane.len());
+            for (sample, (&expected, &actual)) in
+                expected_plane.iter().zip(actual_plane).enumerate()
+            {
+                assert!(expected.is_finite() && actual.is_finite());
+                if expected == 0.0 || actual == 0.0 {
+                    assert_eq!(
+                        expected.to_bits(),
+                        actual.to_bits(),
+                        "partition changed zero sign at speaker {speaker}, sample {sample}"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    expected.is_sign_positive(),
+                    actual.is_sign_positive(),
+                    "partition changed gain sign at speaker {speaker}, sample {sample}"
+                );
+                let ulp = ordered_f64_bits(expected).abs_diff(ordered_f64_bits(actual));
+                assert!(
+                    ulp <= MAX_PARTITION_INVARIANCE_ULPS,
+                    "partition mismatch at speaker {speaker}, sample {sample}: expected {expected:.17e}, actual {actual:.17e}, abs {:.17e}, rel {:.17e}, ulp {ulp}",
+                    (expected - actual).abs(),
+                    (expected - actual).abs()
+                        / expected.abs().max(actual.abs()).max(f64::MIN_POSITIVE),
+                );
+            }
+        }
+    }
+
+    fn source(
+        id: u64,
+        samples: &[f64],
+        x: f64,
+        y: f64,
+        z: f64,
+        gain: f64,
+    ) -> ExplicitSpatialSource<'_> {
+        ExplicitSpatialSource::new(
+            SourceId::new(id),
+            samples,
+            CartesianPosition::new(x, y, z),
+            gain,
+        )
+        .unwrap()
+    }
+
+    fn oracle_gains(x: f64, y: f64) -> (f64, f64) {
+        let theta = x.atan2(y);
+        let u = (theta + std::f64::consts::FRAC_PI_2) / std::f64::consts::PI;
+        (
+            (u * std::f64::consts::FRAC_PI_2).cos(),
+            (u * std::f64::consts::FRAC_PI_2).sin(),
+        )
+    }
+
+    fn assert_pair(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= EPSILON,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_left_center_and_hard_right_match_independent_oracle() {
+        let impulse = [1.0];
+        for (id, x, y) in [(1, -1.0, 1.0), (2, 0.0, 1.0), (3, 1.0, 1.0)] {
+            let source = source(id, &impulse, x, y, 0.0, 1.0);
+            let mut left = [0.0];
+            let mut right = [0.0];
+            StereoRenderer::new()
+                .render_block(&[source], &mut left, &mut right)
+                .unwrap();
+            let (expected_left, expected_right) = oracle_gains(x, y);
+            assert_pair(&left, &[expected_left]);
+            assert_pair(&right, &[expected_right]);
+        }
+    }
+
+    #[test]
+    fn intermediate_azimuth_uses_equal_power_oracle() {
+        let samples = [1.0, -0.25, 0.5];
+        let source = source(4, &samples, 1.0, 1.0, 0.0, 1.0);
+        let mut left = [0.0; 3];
+        let mut right = [0.0; 3];
+        StereoRenderer::new()
+            .render_block(&[source], &mut left, &mut right)
+            .unwrap();
+        let (left_gain, right_gain) = oracle_gains(1.0, 1.0);
+        assert_pair(&left, &[left_gain, -0.25 * left_gain, 0.5 * left_gain]);
+        assert_pair(&right, &[right_gain, -0.25 * right_gain, 0.5 * right_gain]);
+    }
+
+    #[test]
+    fn center_sine_and_explicit_gain_are_linear() {
+        let sine: Vec<_> = (0..32)
+            .map(|index| (2.0 * std::f64::consts::PI * index as f64 / 32.0).sin())
+            .collect();
+        let source = source(5, &sine, 0.0, 1.0, 0.0, 0.25);
+        let mut left = vec![0.0; sine.len()];
+        let mut right = vec![0.0; sine.len()];
+        StereoRenderer::new()
+            .render_block(&[source], &mut left, &mut right)
+            .unwrap();
+        let gain = 1.0 / 2.0_f64.sqrt() * 0.25;
+        for ((actual_left, actual_right), sample) in left.iter().zip(&right).zip(&sine) {
+            assert!((actual_left - sample * gain).abs() <= EPSILON);
+            assert!((actual_right - sample * gain).abs() <= EPSILON);
+        }
+    }
+
+    #[test]
+    fn two_sources_accumulate_without_clipping() {
+        let first = source(6, &[0.8, 0.8], 0.0, 1.0, 0.0, 1.0);
+        let second = source(7, &[0.8, 0.8], 0.0, 1.0, 0.0, 1.0);
+        let mut left = [0.0; 2];
+        let mut right = [0.0; 2];
+        StereoRenderer::new()
+            .render_block(&[first, second], &mut left, &mut right)
+            .unwrap();
+        let expected = 1.6 / 2.0_f64.sqrt();
+        assert_pair(&left, &[expected, expected]);
+        assert_pair(&right, &[expected, expected]);
+    }
+
+    #[test]
+    fn energy_is_normalized_for_public_positions() {
+        for (x, y) in [(-1.0, 1.0), (-0.5, 1.0), (0.0, 1.0), (0.5, 1.0), (1.0, 1.0)] {
+            let gains = StereoGains::for_position(CartesianPosition::new(x, y, 0.0)).unwrap();
+            assert!(
+                (gains.left.mul_add(gains.left, gains.right * gains.right) - 1.0).abs() < EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn partitioning_reuses_buffers_and_is_byte_identical() {
+        let samples = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6];
+        let whole_source = source(8, &samples, 0.25, 1.0, 0.0, 0.75);
+        let renderer = StereoRenderer::new();
+        let mut whole_left = [0.0; 6];
+        let mut whole_right = [0.0; 6];
+        renderer
+            .render_block(&[whole_source], &mut whole_left, &mut whole_right)
+            .unwrap();
+
+        let mut partitioned_left = [99.0; 6];
+        let mut partitioned_right = [99.0; 6];
+        let left_ptr = partitioned_left.as_ptr();
+        let right_ptr = partitioned_right.as_ptr();
+        for (start, end) in [(0, 2), (2, 5), (5, 6)] {
+            let part = source(8, &samples[start..end], 0.25, 1.0, 0.0, 0.75);
+            renderer
+                .render_block(
+                    &[part],
+                    &mut partitioned_left[start..end],
+                    &mut partitioned_right[start..end],
+                )
+                .unwrap();
+        }
+        assert_eq!(partitioned_left.as_ptr(), left_ptr);
+        assert_eq!(partitioned_right.as_ptr(), right_ptr);
+        assert_eq!(whole_left, partitioned_left);
+        assert_eq!(whole_right, partitioned_right);
+    }
+
+    #[test]
+    fn linearity_holds_for_source_separation() {
+        let first_samples = [0.25, -0.5, 0.75];
+        let second_samples = [0.5, 0.25, -0.125];
+        let first = source(9, &first_samples, -0.5, 1.0, 0.0, 0.5);
+        let second = source(10, &second_samples, 0.5, 1.0, 0.0, 0.75);
+        let mut mixed_left = [0.0; 3];
+        let mut mixed_right = [0.0; 3];
+        StereoRenderer::new()
+            .render_block(&[first, second], &mut mixed_left, &mut mixed_right)
+            .unwrap();
+
+        let mut first_left = [0.0; 3];
+        let mut first_right = [0.0; 3];
+        let mut second_left = [0.0; 3];
+        let mut second_right = [0.0; 3];
+        StereoRenderer::new()
+            .render_block(&[first], &mut first_left, &mut first_right)
+            .unwrap();
+        StereoRenderer::new()
+            .render_block(&[second], &mut second_left, &mut second_right)
+            .unwrap();
+        for index in 0..3 {
+            assert_eq!(mixed_left[index], first_left[index] + second_left[index]);
+            assert_eq!(mixed_right[index], first_right[index] + second_right[index]);
+        }
+    }
+
+    #[test]
+    fn valid_finite_input_produces_finite_output() {
+        let source = source(11, &[f64::MAX / 4.0], 0.0, 1.0, 0.0, 0.5);
+        let mut left = [0.0];
+        let mut right = [0.0];
+        StereoRenderer::new()
+            .render_block(&[source], &mut left, &mut right)
+            .unwrap();
+        assert!(left[0].is_finite());
+        assert!(right[0].is_finite());
+    }
+
+    #[test]
+    fn invalid_coordinates_and_unsupported_rear_are_rejected() {
+        let samples = [1.0];
+        assert!(matches!(
+            ExplicitSpatialSource::new(
+                SourceId::new(12),
+                &samples,
+                CartesianPosition::new(f64::NAN, 1.0, 0.0),
+                1.0,
+            ),
+            Err(RenderError::NonFinitePosition { axis: "x", .. })
+        ));
+        assert!(matches!(
+            StereoGains::for_position(CartesianPosition::new(0.0, 0.0, 0.0)),
+            Err(RenderError::UndefinedHorizontalDirection)
+        ));
+        assert!(matches!(
+            StereoGains::for_position(CartesianPosition::new(0.0, -1.0, 0.0)),
+            Err(RenderError::RearHemisphereUnsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn buffer_and_source_length_contracts_reject_without_stale_output() {
+        let source = source(13, &[1.0, 2.0], 0.0, 1.0, 0.0, 1.0);
+        let mut left = [7.0; 1];
+        let mut right = [8.0; 2];
+        assert!(matches!(
+            StereoRenderer::new().render_block(&[source], &mut left, &mut right),
+            Err(RenderError::StereoOutputLengthMismatch { .. })
+        ));
+        let mut left = [7.0; 1];
+        let mut right = [8.0; 1];
+        assert!(matches!(
+            StereoRenderer::new().render_block(&[source], &mut left, &mut right),
+            Err(RenderError::SourceBlockLengthMismatch { .. })
+        ));
+        assert_eq!(left, [7.0]);
+        assert_eq!(right, [8.0]);
+    }
+
+    #[test]
+    fn explicit_scene_rejects_duplicate_ids_and_keeps_binding_explicit() {
+        let samples = [0.0];
+        let first = source(14, &samples, -1.0, 1.0, 0.0, 1.0);
+        let second = source(14, &samples, 1.0, 1.0, 0.0, 1.0);
+        assert!(matches!(
+            ExplicitSpatialScene::new(48_000, &[first, second]),
+            Err(RenderError::DuplicateSourceId { .. })
+        ));
+        let explicit_id = SourceId::new(15);
+        let explicit = source(explicit_id.get(), &samples, 0.0, 1.0, 0.0, 1.0);
+        assert_eq!(explicit.id(), explicit_id);
+        // There is intentionally no constructor accepting decoder component
+        // or ReconstructionBasis types; explicit source identity is required.
+    }
+
+    #[test]
+    fn renderer_manifest_stays_independent_of_decoder_scene_crates() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(!manifest.contains("openjoc-scene"));
+        assert!(!manifest.contains("openjoc-joc"));
+        assert!(!manifest.contains("DecodedJocComponents"));
+    }
+
+    #[test]
+    fn overflowing_finite_mix_is_rejected_without_nonfinite_output() {
+        let source = source(16, &[f64::MAX], 0.0, 1.0, 0.0, 2.0);
+        let mut left = [9.0];
+        let mut right = [9.0];
+        assert!(matches!(
+            StereoRenderer::new().render_block(&[source], &mut left, &mut right),
+            Err(RenderError::NonFiniteOutput { .. })
+        ));
+        assert_eq!(left, [0.0]);
+        assert_eq!(right, [0.0]);
+    }
+
+    fn speaker(id: u64, x: f64, y: f64) -> Speaker2d {
+        Speaker2d::new(SpeakerId::new(id), CartesianPosition::new(x, y, 0.0)).unwrap()
+    }
+
+    fn cardinal_layout() -> SpeakerLayout2d {
+        SpeakerLayout2d::new(vec![
+            speaker(10, 0.0, 1.0),
+            speaker(20, 1.0, 0.0),
+            speaker(30, 0.0, -1.0),
+            speaker(40, -1.0, 0.0),
+        ])
+        .unwrap()
+    }
+
+    fn render_planes(
+        renderer: &LayoutRenderer2d,
+        sources: &[ExplicitSpatialSource<'_>],
+        length: usize,
+    ) -> Vec<Vec<f64>> {
+        let mut planes = vec![vec![0.0; length]; renderer.layout().speaker_count()];
+        {
+            let mut outputs: Vec<&mut [f64]> = planes.iter_mut().map(Vec::as_mut_slice).collect();
+            renderer.render_block(sources, &mut outputs).unwrap();
+        }
+        planes
+    }
+
+    fn expected_vbap(first: (f64, f64), second: (f64, f64), source: (f64, f64)) -> (f64, f64) {
+        let determinant = first.0 * second.1 - second.0 * first.1;
+        let raw_first = (source.0 * second.1 - second.0 * source.1) / determinant;
+        let raw_second = (first.0 * source.1 - source.0 * first.1) / determinant;
+        let norm = (raw_first * raw_first + raw_second * raw_second).sqrt();
+        (raw_first / norm, raw_second / norm)
+    }
+
+    #[test]
+    fn two_speaker_front_sector_matches_independent_vbap_oracle() {
+        let layout =
+            SpeakerLayout2d::new(vec![speaker(1, -1.0, 1.0), speaker(2, 1.0, 1.0)]).unwrap();
+        let gains = layout
+            .pair_gains(CartesianPosition::new(0.0, 1.0, 3.0))
+            .unwrap();
+        let expected = expected_vbap(
+            (-1.0 / 2.0_f64.sqrt(), 1.0 / 2.0_f64.sqrt()),
+            (1.0 / 2.0_f64.sqrt(), 1.0 / 2.0_f64.sqrt()),
+            (0.0, 1.0),
+        );
+        assert_eq!(gains.pair().first_index(), 0);
+        assert_eq!(gains.pair().second_index(), 1);
+        assert!((gains.first() - expected.0).abs() <= EPSILON);
+        assert!((gains.second() - expected.1).abs() <= EPSILON);
+        assert!(
+            (gains.first() * gains.first() + gains.second() * gains.second() - 1.0).abs()
+                <= EPSILON
+        );
+    }
+
+    #[test]
+    fn public_output_order_survives_internal_azimuth_sort() {
+        let layout = SpeakerLayout2d::new(vec![
+            speaker(20, 1.0, 0.0),
+            speaker(10, 0.0, 1.0),
+            speaker(40, -1.0, 0.0),
+            speaker(30, 0.0, -1.0),
+        ])
+        .unwrap();
+        assert_eq!(layout.speakers()[0].id(), SpeakerId::new(20));
+        assert_eq!(layout.speakers()[1].id(), SpeakerId::new(10));
+        assert_eq!(layout.sorted_indices(), &[3, 2, 1, 0]);
+        let source = source(50, &[1.0], 0.0, 1.0, 0.0, 1.0);
+        let planes = render_planes(&LayoutRenderer2d::new(layout), &[source], 1);
+        assert_eq!(planes, vec![vec![0.0], vec![1.0], vec![0.0], vec![0.0]]);
+    }
+
+    #[test]
+    fn full_circle_layout_renders_side_rear_and_wrap_pair() {
+        let renderer = LayoutRenderer2d::new(cardinal_layout());
+        let side = source(51, &[1.0], 1.0, 0.0, 0.0, 1.0);
+        let rear = source(52, &[1.0], 0.0, -1.0, 0.0, 1.0);
+        let wrap = source(53, &[1.0], 1.0, -1.0, 0.0, 1.0);
+        let side_planes = render_planes(&renderer, &[side], 1);
+        assert_eq!(
+            side_planes,
+            vec![vec![0.0], vec![1.0], vec![0.0], vec![0.0]]
+        );
+        let rear_planes = render_planes(&renderer, &[rear], 1);
+        assert_eq!(
+            rear_planes,
+            vec![vec![0.0], vec![0.0], vec![1.0], vec![0.0]]
+        );
+        let wrap_planes = render_planes(&renderer, &[wrap], 1);
+        let half = 1.0 / 2.0_f64.sqrt();
+        assert_eq!(wrap_planes[0], vec![0.0]);
+        assert!((wrap_planes[1][0] - half).abs() <= EPSILON);
+        assert!((wrap_planes[2][0] - half).abs() <= EPSILON);
+        assert_eq!(wrap_planes[3], vec![0.0]);
+    }
+
+    #[test]
+    fn partial_layout_rejects_uncovered_rear_direction() {
+        let layout = SpeakerLayout2d::new(vec![
+            speaker(60, -1.0, 1.0),
+            speaker(61, 0.0, 1.0),
+            speaker(62, 1.0, 1.0),
+        ])
+        .unwrap();
+        assert!(matches!(
+            layout.pair_gains(CartesianPosition::new(0.0, -1.0, 0.0)),
+            Err(RenderError::UnsupportedDirection { .. })
+        ));
+    }
+
+    #[test]
+    fn irregular_five_speaker_layout_has_deterministic_angular_sweep() {
+        let layout = SpeakerLayout2d::new(vec![
+            speaker(70, 0.0, 1.0),
+            speaker(71, 0.95, 0.31),
+            speaker(72, 0.59, -0.81),
+            speaker(73, -0.81, -0.59),
+            speaker(74, -0.95, 0.31),
+        ])
+        .unwrap();
+        for step in 0..720 {
+            let theta = -std::f64::consts::PI + TWO_PI * step as f64 / 720.0;
+            let position = CartesianPosition::new(theta.sin(), theta.cos(), 10.0);
+            let first = layout.pair_gains(position).unwrap();
+            let second = layout.pair_gains(position).unwrap();
+            assert_eq!(first, second);
+            assert!(first.first().is_finite() && first.second().is_finite());
+            assert!(first.first() >= -EPSILON && first.second() >= -EPSILON);
+            assert!(
+                (first.first() * first.first() + first.second() * first.second() - 1.0).abs()
+                    <= EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn pair_boundary_is_continuous_at_shared_speaker() {
+        let layout = cardinal_layout();
+        let epsilon = 1.0e-8;
+        for theta in [
+            -std::f64::consts::FRAC_PI_2,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        ] {
+            let before = layout
+                .pair_gains(CartesianPosition::new(
+                    (theta - epsilon).sin(),
+                    (theta - epsilon).cos(),
+                    0.0,
+                ))
+                .unwrap();
+            let after = layout
+                .pair_gains(CartesianPosition::new(
+                    (theta + epsilon).sin(),
+                    (theta + epsilon).cos(),
+                    0.0,
+                ))
+                .unwrap();
+            assert!(before.first().abs() < 1.0 || before.second().abs() < 1.0);
+            assert!((before.first() - after.first()).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn layout_validation_rejects_duplicate_ids_azimuths_and_opposed_only_layouts() {
+        assert!(matches!(
+            SpeakerLayout2d::new(vec![speaker(80, 0.0, 1.0), speaker(80, 1.0, 0.0)]),
+            Err(RenderError::DuplicateSpeakerId { .. })
+        ));
+        assert!(matches!(
+            SpeakerLayout2d::new(vec![speaker(81, 0.0, 1.0), speaker(82, 0.0, 2.0)]),
+            Err(RenderError::DuplicateSpeakerAzimuth { .. })
+        ));
+        assert!(matches!(
+            SpeakerLayout2d::new(vec![speaker(83, 0.0, 1.0), speaker(84, 0.0, -1.0)]),
+            Err(RenderError::NoUsableSpeakerPair)
+        ));
+    }
+
+    #[test]
+    fn layout_block_mixes_multiple_pairs_and_is_partition_invariant() {
+        let renderer = LayoutRenderer2d::new(cardinal_layout());
+        let first_samples = [0.25, -0.5, 0.75, -1.0];
+        let second_samples = [0.5, 0.25, -0.125, 0.25];
+        let first = source(90, &first_samples, 0.0, 1.0, 0.0, 0.5);
+        let second = source(91, &second_samples, 1.0, -1.0, 0.0, 0.75);
+        let whole = render_planes(&renderer, &[first, second], 4);
+        let mut partitioned = vec![vec![0.0; 4]; 4];
+        for (start, end) in [(0, 1), (1, 3), (3, 4)] {
+            let one = source(90, &first_samples[start..end], 0.0, 1.0, 0.0, 0.5);
+            let two = source(91, &second_samples[start..end], 1.0, -1.0, 0.0, 0.75);
+            let mut outputs: Vec<&mut [f64]> = partitioned
+                .iter_mut()
+                .map(|plane| &mut plane[start..end])
+                .collect();
+            renderer.render_block(&[one, two], &mut outputs).unwrap();
+        }
+        assert_eq!(whole, partitioned);
+    }
+
+    #[test]
+    fn layout_output_contract_rejects_wrong_planes_without_mutation() {
+        let renderer = LayoutRenderer2d::new(cardinal_layout());
+        let source = source(92, &[1.0, 2.0], 0.0, 1.0, 0.0, 1.0);
+        let mut too_few = vec![vec![7.0; 2]; 3];
+        let mut refs: Vec<&mut [f64]> = too_few.iter_mut().map(Vec::as_mut_slice).collect();
+        assert!(matches!(
+            renderer.render_block(&[source], &mut refs),
+            Err(RenderError::SpeakerOutputCountMismatch { .. })
+        ));
+        assert_eq!(too_few, vec![vec![7.0; 2]; 3]);
+
+        let mut wrong_lengths = [vec![7.0; 2], vec![8.0; 1], vec![9.0; 2], vec![10.0; 2]];
+        let mut refs: Vec<&mut [f64]> = wrong_lengths.iter_mut().map(Vec::as_mut_slice).collect();
+        assert!(matches!(
+            renderer.render_block(&[source], &mut refs),
+            Err(RenderError::SpeakerOutputLengthMismatch { .. })
+        ));
+        assert_eq!(wrong_lengths[1], vec![8.0]);
+    }
+
+    #[test]
+    fn two_dimensional_renderer_has_no_decoder_or_object_bridge() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(!manifest.contains("openjoc-eac3"));
+        assert!(!manifest.contains("DecodedJocComponents"));
+        assert!(Speaker2d::new(SpeakerId::new(93), CartesianPosition::new(0.0, 1.0, 9.0)).is_ok());
+    }
+
+    fn state(x: f64, y: f64, z: f64, gain: f64) -> SpatialState2d {
+        SpatialState2d::new(CartesianPosition::new(x, y, z), gain).unwrap()
+    }
+
+    fn segment(
+        start: u64,
+        end: u64,
+        start_state: SpatialState2d,
+        end_state: SpatialState2d,
+        path: AzimuthPath2d,
+    ) -> TrajectorySegment2d {
+        TrajectorySegment2d::new(start, end, start_state, end_state, path).unwrap()
+    }
+
+    fn render_stereo_trajectory(
+        renderer: StereoRenderer,
+        trajectory: &SourceTrajectory2d,
+        samples: &[f64],
+        start: u64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut left = vec![0.0; samples.len()];
+        let mut right = vec![0.0; samples.len()];
+        let source =
+            TrajectorySourceBlock::new(SourceId::new(100), samples, trajectory, start).unwrap();
+        renderer
+            .render_trajectory_block(&[source], &mut left, &mut right)
+            .unwrap();
+        (left, right)
+    }
+
+    #[test]
+    fn trajectory_evaluates_exact_endpoints_and_linear_gain_on_absolute_timeline() {
+        let trajectory = SourceTrajectory2d::new(vec![segment(
+            10,
+            20,
+            state(-1.0, 1.0, 2.0, 0.25),
+            state(1.0, 1.0, 4.0, 0.75),
+            AzimuthPath2d::Shortest,
+        )])
+        .unwrap();
+        assert_eq!(
+            trajectory.evaluate(10).unwrap(),
+            state(-1.0, 1.0, 2.0, 0.25)
+        );
+        assert_eq!(trajectory.evaluate(20).unwrap(), state(1.0, 1.0, 4.0, 0.75));
+        let middle = trajectory.evaluate(15).unwrap();
+        assert!((middle.position().x - 0.0).abs() < EPSILON);
+        assert!((middle.position().y - 1.0).abs() < EPSILON);
+        assert!((middle.position().z - 3.0).abs() < EPSILON);
+        assert!((middle.gain() - 0.5).abs() < EPSILON);
+    }
+
+    #[test]
+    fn trajectory_render_matches_independent_absolute_sample_oracle() {
+        let trajectory = SourceTrajectory2d::new(vec![segment(
+            10,
+            14,
+            state(-1.0, 1.0, 0.0, 0.5),
+            state(1.0, 1.0, 0.0, 1.0),
+            AzimuthPath2d::Shortest,
+        )])
+        .unwrap();
+        let samples = [1.0; 5];
+        let (left, right) =
+            render_stereo_trajectory(StereoRenderer::new(), &trajectory, &samples, 10);
+        let start_theta = (-1.0_f64).atan2(1.0);
+        let end_theta = 1.0_f64.atan2(1.0);
+        let delta = end_theta - start_theta;
+        for (offset, (&actual_left, &actual_right)) in left.iter().zip(&right).enumerate() {
+            let t = offset as f64 / 4.0;
+            let theta = start_theta + t * delta;
+            let position_u = (theta + std::f64::consts::FRAC_PI_2) / std::f64::consts::PI;
+            let expected_left = (position_u * std::f64::consts::FRAC_PI_2).cos();
+            let expected_right = (position_u * std::f64::consts::FRAC_PI_2).sin();
+            let expected_gain = 0.5 + t * 0.5;
+            assert!((actual_left - expected_left * expected_gain).abs() < EPSILON);
+            assert!((actual_right - expected_right * expected_gain).abs() < EPSILON);
+        }
+    }
+
+    #[test]
+    fn trajectory_validation_rejects_gaps_overlaps_discontinuities_and_bad_spans() {
+        let first = segment(
+            0,
+            3,
+            state(0.0, 1.0, 0.0, 1.0),
+            state(1.0, 0.0, 0.0, 1.0),
+            AzimuthPath2d::Increasing,
+        );
+        let mismatched = segment(
+            3,
+            5,
+            state(-1.0, 0.0, 0.0, 1.0),
+            state(0.0, -1.0, 0.0, 1.0),
+            AzimuthPath2d::Increasing,
+        );
+        assert!(matches!(
+            SourceTrajectory2d::new(vec![first, mismatched]),
+            Err(RenderError::DiscontinuousTrajectory { boundary: 3 })
+        ));
+        let gap = segment(
+            4,
+            5,
+            state(1.0, 0.0, 0.0, 1.0),
+            state(0.0, -1.0, 0.0, 1.0),
+            AzimuthPath2d::Increasing,
+        );
+        assert!(matches!(
+            SourceTrajectory2d::new(vec![first, gap]),
+            Err(RenderError::NonContiguousTrajectory { .. })
+        ));
+        assert!(matches!(
+            TrajectorySegment2d::new(
+                0,
+                MAX_EXACT_INTERPOLATION_SPAN + 1,
+                state(0.0, 1.0, 0.0, 1.0),
+                state(1.0, 0.0, 0.0, 1.0),
+                AzimuthPath2d::Increasing,
+            ),
+            Err(RenderError::TrajectorySpanTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn shortest_antipodal_is_rejected_and_explicit_stereo_paths_are_deterministic() {
+        let left = state(-1.0, 0.0, 0.0, 1.0);
+        let right = state(1.0, 0.0, 0.0, 1.0);
+        assert!(matches!(
+            TrajectorySegment2d::new(0, 4, left, right, AzimuthPath2d::Shortest),
+            Err(RenderError::AmbiguousAntipodalPath)
+        ));
+        let front_path =
+            SourceTrajectory2d::new(vec![segment(0, 4, left, right, AzimuthPath2d::Increasing)])
+                .unwrap();
+        let rear_path =
+            SourceTrajectory2d::new(vec![segment(0, 4, left, right, AzimuthPath2d::Decreasing)])
+                .unwrap();
+        let samples = [1.0; 5];
+        let (front_left, front_right) =
+            render_stereo_trajectory(StereoRenderer::new(), &front_path, &samples, 0);
+        assert!((front_left[2] - std::f64::consts::FRAC_1_SQRT_2).abs() < EPSILON);
+        assert!((front_right[2] - std::f64::consts::FRAC_1_SQRT_2).abs() < EPSILON);
+        let source =
+            TrajectorySourceBlock::new(SourceId::new(101), &samples, &rear_path, 0).unwrap();
+        let mut left_out = [9.0; 5];
+        let mut right_out = [8.0; 5];
+        assert!(matches!(
+            StereoRenderer::new().render_trajectory_block(&[source], &mut left_out, &mut right_out),
+            Err(RenderError::RearHemisphereUnsupported { .. })
+        ));
+        assert_eq!(left_out, [9.0; 5]);
+        assert_eq!(right_out, [8.0; 5]);
+    }
+
+    #[test]
+    fn stereo_trajectory_is_byte_identical_across_absolute_block_partitions() {
+        let trajectory = SourceTrajectory2d::new(vec![segment(
+            0,
+            15,
+            state(-1.0, 1.0, 0.0, 0.25),
+            state(1.0, 1.0, 0.0, 0.75),
+            AzimuthPath2d::Shortest,
+        )])
+        .unwrap();
+        let samples: Vec<f64> = (0..16).map(|i| (i as f64 - 4.0) / 7.0).collect();
+        let whole = render_stereo_trajectory(StereoRenderer::new(), &trajectory, &samples, 0);
+        let mut left = vec![0.0; samples.len()];
+        let mut right = vec![0.0; samples.len()];
+        for (start, end) in [(0_usize, 1_usize), (1, 5), (5, 6), (6, 11), (11, 16)] {
+            let source = TrajectorySourceBlock::new(
+                SourceId::new(100),
+                &samples[start..end],
+                &trajectory,
+                start as u64,
+            )
+            .unwrap();
+            StereoRenderer::new()
+                .render_trajectory_block(&[source], &mut left[start..end], &mut right[start..end])
+                .unwrap();
+        }
+        assert_eq!(left, whole.0);
+        assert_eq!(right, whole.1);
+    }
+
+    #[test]
+    fn layout_trajectory_supports_multiple_sources_and_partition_invariance() {
+        let renderer = LayoutRenderer2d::new(cardinal_layout());
+        let first_trajectory = SourceTrajectory2d::new(vec![segment(
+            0,
+            7,
+            state(0.0, 1.0, 0.0, 0.5),
+            state(1.0, 0.0, 0.0, 1.0),
+            AzimuthPath2d::Increasing,
+        )])
+        .unwrap();
+        let second_trajectory = SourceTrajectory2d::new(vec![segment(
+            0,
+            7,
+            state(-1.0, 0.0, 0.0, 0.75),
+            state(0.0, -1.0, 0.0, 0.25),
+            AzimuthPath2d::Decreasing,
+        )])
+        .unwrap();
+        let first_samples = [1.0, -0.5, 0.25, 0.75, -0.25, 0.5, 1.0, -1.0];
+        let second_samples = [0.5; 8];
+        let mut whole = vec![vec![0.0; 8]; 4];
+        let first =
+            TrajectorySourceBlock::new(SourceId::new(110), &first_samples, &first_trajectory, 0)
+                .unwrap();
+        let second =
+            TrajectorySourceBlock::new(SourceId::new(111), &second_samples, &second_trajectory, 0)
+                .unwrap();
+        let mut whole_refs: Vec<&mut [f64]> = whole.iter_mut().map(Vec::as_mut_slice).collect();
+        renderer
+            .render_trajectory_block(&[first, second], &mut whole_refs)
+            .unwrap();
+        let mut partitioned = vec![vec![0.0; 8]; 4];
+        for (start, end) in [(0_usize, 2_usize), (2, 3), (3, 8)] {
+            let first = TrajectorySourceBlock::new(
+                SourceId::new(110),
+                &first_samples[start..end],
+                &first_trajectory,
+                start as u64,
+            )
+            .unwrap();
+            let second = TrajectorySourceBlock::new(
+                SourceId::new(111),
+                &second_samples[start..end],
+                &second_trajectory,
+                start as u64,
+            )
+            .unwrap();
+            let mut outputs: Vec<&mut [f64]> = partitioned
+                .iter_mut()
+                .map(|plane| &mut plane[start..end])
+                .collect();
+            renderer
+                .render_trajectory_block(&[first, second], &mut outputs)
+                .unwrap();
+        }
+        assert_eq!(partitioned, whole);
+    }
+
+    #[test]
+    fn static_trajectory_is_identical_to_static_renderers() {
+        let samples = [0.25, -0.5, 0.75];
+        let static_source = source(120, &samples, 0.5, 1.0, 0.0, 0.8);
+        let trajectory = SourceTrajectory2d::new(vec![segment(
+            0,
+            2,
+            state(0.5, 1.0, 0.0, 0.8),
+            state(0.5, 1.0, 0.0, 0.8),
+            AzimuthPath2d::Shortest,
+        )])
+        .unwrap();
+        let dynamic_source =
+            TrajectorySourceBlock::new(SourceId::new(120), &samples, &trajectory, 0).unwrap();
+        let mut static_left = [0.0; 3];
+        let mut static_right = [0.0; 3];
+        StereoRenderer::new()
+            .render_block(&[static_source], &mut static_left, &mut static_right)
+            .unwrap();
+        let mut dynamic_left = [0.0; 3];
+        let mut dynamic_right = [0.0; 3];
+        StereoRenderer::new()
+            .render_trajectory_block(&[dynamic_source], &mut dynamic_left, &mut dynamic_right)
+            .unwrap();
+        assert_eq!(static_left, dynamic_left);
+        assert_eq!(static_right, dynamic_right);
+
+        let layout = LayoutRenderer2d::new(cardinal_layout());
+        let static_planes = render_planes(&layout, &[static_source], 3);
+        let mut dynamic_planes = vec![vec![0.0; 3]; 4];
+        let mut outputs: Vec<&mut [f64]> =
+            dynamic_planes.iter_mut().map(Vec::as_mut_slice).collect();
+        layout
+            .render_trajectory_block(&[dynamic_source], &mut outputs)
+            .unwrap();
+        assert_eq!(static_planes, dynamic_planes);
+    }
+
+    #[test]
+    fn trajectory_blocks_reject_duplicate_ids_and_out_of_range_without_mutation() {
+        let trajectory = SourceTrajectory2d::new(vec![segment(
+            5,
+            7,
+            state(0.0, 1.0, 0.0, 1.0),
+            state(0.0, 1.0, 0.0, 1.0),
+            AzimuthPath2d::Shortest,
+        )])
+        .unwrap();
+        assert!(matches!(
+            TrajectorySourceBlock::new(SourceId::new(122), &[1.0], &trajectory, 4),
+            Err(RenderError::TrajectoryBlockOutOfRange { .. })
+        ));
+        let samples = [1.0, 1.0];
+        let first =
+            TrajectorySourceBlock::new(SourceId::new(123), &samples, &trajectory, 5).unwrap();
+        let second =
+            TrajectorySourceBlock::new(SourceId::new(123), &samples, &trajectory, 5).unwrap();
+        let mut left = [7.0; 2];
+        let mut right = [8.0; 2];
+        assert!(matches!(
+            StereoRenderer::new().render_trajectory_block(&[first, second], &mut left, &mut right),
+            Err(RenderError::DuplicateSourceId { .. })
+        ));
+        assert_eq!(left, [7.0; 2]);
+        assert_eq!(right, [8.0; 2]);
+    }
+
+    fn speaker3(id: u64, x: f64, y: f64, z: f64) -> Speaker3d {
+        Speaker3d::new(SpeakerId::new(id), CartesianPosition::new(x, y, z)).unwrap()
+    }
+
+    fn triplet(first: u64, second: u64, third: u64) -> SpeakerTriplet3d {
+        SpeakerTriplet3d::new(
+            SpeakerId::new(first),
+            SpeakerId::new(second),
+            SpeakerId::new(third),
+        )
+        .unwrap()
+    }
+
+    fn octahedron_layout() -> SpeakerLayout3d {
+        SpeakerLayout3d::new(
+            vec![
+                speaker3(200, 1.0, 0.0, 0.0),
+                speaker3(201, -1.0, 0.0, 0.0),
+                speaker3(202, 0.0, 1.0, 0.0),
+                speaker3(203, 0.0, -1.0, 0.0),
+                speaker3(204, 0.0, 0.0, 1.0),
+                speaker3(205, 0.0, 0.0, -1.0),
+            ],
+            vec![
+                triplet(200, 202, 204),
+                triplet(200, 204, 203),
+                triplet(200, 203, 205),
+                triplet(200, 205, 202),
+                triplet(201, 204, 202),
+                triplet(201, 203, 204),
+                triplet(201, 205, 203),
+                triplet(201, 202, 205),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn render_planes3(
+        renderer: &LayoutRenderer3d,
+        sources: &[ExplicitSpatialSource<'_>],
+        length: usize,
+    ) -> Vec<Vec<f64>> {
+        let mut planes = vec![vec![0.0; length]; renderer.layout().speaker_count()];
+        let mut outputs: Vec<&mut [f64]> = planes.iter_mut().map(Vec::as_mut_slice).collect();
+        renderer.render_block(sources, &mut outputs).unwrap();
+        planes
+    }
+
+    fn unit_direction(x: f64, y: f64, z: f64) -> CartesianPosition {
+        let norm = (x * x + y * y + z * z).sqrt();
+        CartesianPosition::new(x / norm, y / norm, z / norm)
+    }
+
+    fn sum_positions(
+        first: CartesianPosition,
+        second: CartesianPosition,
+        third: CartesianPosition,
+    ) -> CartesianPosition {
+        CartesianPosition::new(
+            first.x + second.x + third.x,
+            first.y + second.y + third.y,
+            first.z + second.z + third.z,
+        )
+    }
+
+    fn full_gains(layout: &SpeakerLayout3d, position: CartesianPosition) -> Vec<f64> {
+        let mut result = vec![0.0; layout.speaker_count()];
+        layout
+            .gains(position)
+            .unwrap()
+            .write_full_gains(&mut result)
+            .unwrap();
+        result
+    }
+
+    fn state3(x: f64, y: f64, z: f64, gain: f64) -> SpatialState3d {
+        SpatialState3d::new(CartesianPosition::new(x, y, z), gain).unwrap()
+    }
+
+    fn segment3(
+        start: u64,
+        end: u64,
+        start_state: SpatialState3d,
+        end_state: SpatialState3d,
+    ) -> TrajectorySegment3d {
+        TrajectorySegment3d::new(start, end, start_state, end_state).unwrap()
+    }
+
+    fn render_trajectory3(
+        renderer: &LayoutRenderer3d,
+        sources: &[TrajectorySourceBlock3d<'_>],
+        length: usize,
+    ) -> Vec<Vec<f64>> {
+        let mut planes = vec![vec![0.0; length]; renderer.layout().speaker_count()];
+        let mut outputs: Vec<&mut [f64]> = planes.iter_mut().map(Vec::as_mut_slice).collect();
+        renderer
+            .render_trajectory_block(sources, &mut outputs)
+            .unwrap();
+        planes
+    }
+
+    fn hrir_entry_test(
+        id: u64,
+        direction: CartesianPosition,
+        left: &[f64],
+        right: &[f64],
+    ) -> HrirEntry {
+        HrirEntry::new(
+            HrirEntryId::new(id),
+            direction,
+            HrirPair::new(48_000, left.to_vec(), right.to_vec()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn binaural_test_bank() -> HrirBank {
+        HrirBank::new(
+            48_000,
+            vec![
+                hrir_entry_test(
+                    1,
+                    CartesianPosition::new(0.0, 1.0, 0.0),
+                    &[0.0, 1.0, 0.5],
+                    &[0.0, 0.25, -0.5],
+                ),
+                hrir_entry_test(
+                    2,
+                    CartesianPosition::new(-1.0, 1.0, 0.0),
+                    &[1.0, -0.25],
+                    &[0.0, 0.75],
+                ),
+                hrir_entry_test(3, CartesianPosition::new(1.0, 1.0, 0.0), &[1.0], &[0.5]),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Frozen test-only copy of `render_block` at merged-QMF `1647fc4`.
+    /// Preserve its old arithmetic here; do not update it with the candidate.
+    fn render_block_original_loop(
+        renderer: &mut BinauralRenderer,
+        blocks: &[BinauralSourceBlock<'_>],
+        left: &mut [f64],
+        right: &mut [f64],
+    ) -> Result<(), RenderError> {
+        renderer.ensure_renderable()?;
+        validate_binaural_outputs(left, right)?;
+        if blocks.len() != renderer.sources.len() {
+            return Err(RenderError::BinauralSourceCountMismatch {
+                expected: renderer.sources.len(),
+                actual: blocks.len(),
+            });
+        }
+        let block_length = left.len();
+        for (block_index, block) in blocks.iter().enumerate() {
+            if block.samples.len() != block_length {
+                return Err(RenderError::SourceBlockLengthMismatch {
+                    id: block.id,
+                    expected: block_length,
+                    actual: block.samples.len(),
+                });
+            }
+            if renderer
+                .sources
+                .iter()
+                .all(|source| source.definition.id != block.id)
+            {
+                return Err(RenderError::UnknownBinauralSource { id: block.id });
+            }
+            if blocks[..block_index]
+                .iter()
+                .any(|previous| previous.id == block.id)
+            {
+                return Err(RenderError::DuplicateBinauralSource { id: block.id });
+            }
+            if let Some(sample_index) = block.samples.iter().position(|sample| !sample.is_finite())
+            {
+                return Err(RenderError::NonFiniteSourceSample {
+                    id: block.id,
+                    sample_index,
+                });
+            }
+        }
+        for source in &renderer.sources {
+            if blocks.iter().all(|block| block.id != source.definition.id) {
+                return Err(RenderError::MissingBinauralSource {
+                    id: source.definition.id,
+                });
+            }
+        }
+        left.fill(0.0);
+        right.fill(0.0);
+        if block_length == 0 {
+            return Ok(());
+        }
+        for source in &mut renderer.sources {
+            let block = blocks
+                .iter()
+                .find(|block| block.id == source.definition.id)
+                .ok_or(RenderError::MissingBinauralSource {
+                    id: source.definition.id,
+                })?;
+            let history_len = source.history.len();
+            for offset in 0..block_length {
+                for tap_index in 0..source.left_taps.len() {
+                    let input = if tap_index <= offset {
+                        block.samples[offset - tap_index] * source.definition.gain
+                    } else {
+                        source.history[history_len - (tap_index - offset)]
+                    };
+                    left[offset] += input * source.left_taps[tap_index];
+                    right[offset] += input * source.right_taps[tap_index];
+                }
+                if !left[offset].is_finite() {
+                    return renderer.numeric_failure(left, right, OutputChannel::Left, offset);
+                }
+                if !right[offset].is_finite() {
+                    return renderer.numeric_failure(left, right, OutputChannel::Right, offset);
+                }
+            }
+        }
+        for source in &mut renderer.sources {
+            let block = blocks
+                .iter()
+                .find(|block| block.id == source.definition.id)
+                .ok_or(RenderError::MissingBinauralSource {
+                    id: source.definition.id,
+                })?;
+            update_binaural_history(&mut source.history, block.samples, source.definition.gain);
+            source.tail_remaining = source.history.len();
+        }
+        Ok(())
+    }
+
+    fn assert_f64_slice_bits(expected: &[f64], actual: &[f64], label: &str) {
+        assert_eq!(expected.len(), actual.len(), "{label} length changed");
+        for (index, (&expected, &actual)) in expected.iter().zip(actual).enumerate() {
+            assert_eq!(
+                expected.to_bits(),
+                actual.to_bits(),
+                "{label}[{index}] differs: expected={expected:.17e}, actual={actual:.17e}"
+            );
+        }
+    }
+
+    fn assert_binaural_state_bits(expected: &BinauralRenderer, actual: &BinauralRenderer) {
+        assert_eq!(expected.sample_rate_hz, actual.sample_rate_hz);
+        assert_eq!(expected.tail_started, actual.tail_started);
+        assert_eq!(expected.finished, actual.finished);
+        assert_eq!(expected.requires_reset, actual.requires_reset);
+        assert_eq!(
+            expected.remaining_tail_samples(),
+            actual.remaining_tail_samples()
+        );
+        assert_eq!(expected.sources.len(), actual.sources.len());
+        for (index, (expected, actual)) in expected.sources.iter().zip(&actual.sources).enumerate()
+        {
+            assert_eq!(
+                expected.definition.id, actual.definition.id,
+                "source {index} ID"
+            );
+            assert_eq!(
+                expected.definition.gain.to_bits(),
+                actual.definition.gain.to_bits(),
+                "source {index} gain"
+            );
+            assert_eq!(expected.left_taps.len(), actual.left_taps.len());
+            assert_eq!(expected.right_taps.len(), actual.right_taps.len());
+            assert_f64_slice_bits(
+                &expected.left_taps,
+                &actual.left_taps,
+                "registered left taps",
+            );
+            assert_f64_slice_bits(
+                &expected.right_taps,
+                &actual.right_taps,
+                "registered right taps",
+            );
+            assert_f64_slice_bits(&expected.history, &actual.history, "source history");
+            assert_eq!(
+                expected.tail_remaining, actual.tail_remaining,
+                "source {index} tail"
+            );
+        }
+    }
+
+    fn oracle_full_convolution(samples: &[f64], gain: f64, taps: &[f64]) -> Vec<f64> {
+        let mut output = vec![0.0; samples.len() + taps.len() - 1];
+        for (sample_index, &sample) in samples.iter().enumerate() {
+            for (tap_index, &tap) in taps.iter().enumerate() {
+                output[sample_index + tap_index] += sample * gain * tap;
+            }
+        }
+        output
+    }
+
+    fn render_binaural_partitioned(
+        renderer: &mut BinauralRenderer,
+        source_blocks: &[(&[f64], SourceId)],
+        partitions: &[usize],
+        tail_partitions: &[usize],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut left_all = Vec::new();
+        let mut right_all = Vec::new();
+        let mut offset = 0;
+        for &length in partitions {
+            let blocks: Vec<_> = source_blocks
+                .iter()
+                .rev()
+                .map(|(samples, id)| {
+                    BinauralSourceBlock::new(*id, &samples[offset..offset + length])
+                })
+                .collect();
+            let mut left = vec![0.0; length];
+            let mut right = vec![0.0; length];
+            renderer
+                .render_block(&blocks, &mut left, &mut right)
+                .unwrap();
+            left_all.extend(left);
+            right_all.extend(right);
+            offset += length;
+        }
+        assert_eq!(offset, source_blocks[0].0.len());
+        for &length in tail_partitions {
+            let mut left = vec![0.0; length];
+            let mut right = vec![0.0; length];
+            renderer.drain_tail_block(&mut left, &mut right).unwrap();
+            left_all.extend(left);
+            right_all.extend(right);
+        }
+        (left_all, right_all)
+    }
+
+    fn oracle_normalize3(vector: [f64; 3]) -> [f64; 3] {
+        let norm = (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
+        [vector[0] / norm, vector[1] / norm, vector[2] / norm]
+    }
+
+    fn oracle_slerp3(start: [f64; 3], end: [f64; 3], t: f64) -> [f64; 3] {
+        let dot = (start[0] * end[0] + start[1] * end[1] + start[2] * end[2]).clamp(-1.0, 1.0);
+        let omega = dot.acos();
+        if omega <= SMALL_ANGLE_3D_TOLERANCE {
+            return oracle_normalize3([
+                (1.0 - t) * start[0] + t * end[0],
+                (1.0 - t) * start[1] + t * end[1],
+                (1.0 - t) * start[2] + t * end[2],
+            ]);
+        }
+        let denominator = omega.sin();
+        oracle_normalize3([
+            (((1.0 - t) * omega).sin() / denominator) * start[0]
+                + ((t * omega).sin() / denominator) * end[0],
+            (((1.0 - t) * omega).sin() / denominator) * start[1]
+                + ((t * omega).sin() / denominator) * end[1],
+            (((1.0 - t) * omega).sin() / denominator) * start[2]
+                + ((t * omega).sin() / denominator) * end[2],
+        ])
+    }
+
+    #[test]
+    fn trajectory_3d_matches_independent_slerp_oracle_and_gain_ramp() {
+        let start = state3(0.0, 1.0, 0.0, 0.25);
+        let end = state3(0.0, 0.0, 1.0, 0.75);
+        let trajectory = SourceTrajectory3d::new(vec![segment3(10, 20, start, end)]).unwrap();
+        for sample in 10..=20 {
+            let t = (sample - 10) as f64 / 10.0;
+            let expected = if sample == 10 {
+                start.direction()
+            } else if sample == 20 {
+                end.direction()
+            } else {
+                oracle_slerp3(start.direction(), end.direction(), t)
+            };
+            let actual = trajectory.evaluate(sample).unwrap();
+            assert!(
+                actual
+                    .direction()
+                    .iter()
+                    .zip(expected)
+                    .all(|(left, right)| (*left - right).abs() <= 2.0e-12)
+            );
+            assert!((actual.gain() - (0.25 + 0.5 * t)).abs() <= EPSILON);
+            assert!(
+                (actual
+                    .direction()
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    - 1.0)
+                    .abs()
+                    <= EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn trajectory_3d_small_angle_branch_is_finite_and_continuous() {
+        let start = state3(1.0, 0.0, 0.0, 0.5);
+        let end = state3(1.0, 1.0e-10, 0.0, 0.75);
+        let trajectory = SourceTrajectory3d::new(vec![segment3(0, 8, start, end)]).unwrap();
+        let mut previous = start.direction();
+        for sample in 0..=8 {
+            let state = trajectory.evaluate(sample).unwrap();
+            assert!(state.direction().iter().all(|value| value.is_finite()));
+            assert!(
+                (state
+                    .direction()
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    - 1.0)
+                    .abs()
+                    <= EPSILON
+            );
+            if sample > 0 {
+                let delta = state
+                    .direction()
+                    .iter()
+                    .zip(previous)
+                    .map(|(left, right)| (left - right).abs())
+                    .fold(0.0, f64::max);
+                assert!(delta <= 2.0e-11);
+            }
+            previous = state.direction();
+        }
+        assert_eq!(trajectory.evaluate(0).unwrap(), start);
+        assert_eq!(trajectory.evaluate(8).unwrap(), end);
+    }
+
+    #[test]
+    fn trajectory_3d_angular_rate_is_constant_on_great_circle() {
+        let start = state3(1.0, 0.0, 0.0, 1.0);
+        let end = state3(0.0, 1.0, 0.0, 1.0);
+        let trajectory = SourceTrajectory3d::new(vec![segment3(100, 200, start, end)]).unwrap();
+        let omega = std::f64::consts::FRAC_PI_2;
+        for sample in [101, 125, 150, 175, 199] {
+            let actual = trajectory.evaluate(sample).unwrap().direction();
+            let angle = actual[1].atan2(actual[0]);
+            let expected = omega * (sample - 100) as f64 / 100.0;
+            assert!((angle - expected).abs() <= 2.0e-12);
+        }
+    }
+
+    #[test]
+    fn trajectory_3d_is_static_equivalent_and_partition_invariant() {
+        let renderer = LayoutRenderer3d::new(octahedron_layout());
+        let samples: Vec<f64> = (0..=16).map(|index| index as f64 / 17.0 - 0.25).collect();
+        let static_position = CartesianPosition::new(0.3, 1.0, 0.4);
+        let static_source = source(
+            290,
+            &samples,
+            static_position.x,
+            static_position.y,
+            static_position.z,
+            0.8,
+        );
+        let static_planes = render_planes3(&renderer, &[static_source], samples.len());
+        let static_state = state3(static_position.x, static_position.y, static_position.z, 0.8);
+        let trajectory =
+            SourceTrajectory3d::new(vec![segment3(0, 16, static_state, static_state)]).unwrap();
+        let dynamic =
+            TrajectorySourceBlock3d::new(SourceId::new(290), &samples, &trajectory, 0).unwrap();
+        let whole = render_trajectory3(&renderer, &[dynamic], samples.len());
+        assert_partition_invariant_3d(&static_planes, &whole);
+
+        let moving = SourceTrajectory3d::new(vec![segment3(
+            0,
+            16,
+            state3(0.0, 1.0, 0.0, 0.5),
+            state3(0.0, 0.0, 1.0, 1.0),
+        )])
+        .unwrap();
+        let mut partitioned = vec![vec![0.0; samples.len()]; renderer.layout().speaker_count()];
+        for (start, end) in [(0_usize, 1_usize), (1, 5), (5, 6), (6, 11), (11, 17)] {
+            let block = TrajectorySourceBlock3d::new(
+                SourceId::new(291),
+                &samples[start..end],
+                &moving,
+                start as u64,
+            )
+            .unwrap();
+            let mut outputs: Vec<&mut [f64]> = partitioned
+                .iter_mut()
+                .map(|plane| &mut plane[start..end])
+                .collect();
+            renderer
+                .render_trajectory_block(&[block], &mut outputs)
+                .unwrap();
+        }
+        let whole_moving = render_trajectory3(
+            &renderer,
+            &[TrajectorySourceBlock3d::new(SourceId::new(291), &samples, &moving, 0).unwrap()],
+            samples.len(),
+        );
+        assert_partition_invariant_3d(&partitioned, &whole_moving);
+    }
+
+    #[test]
+    fn trajectory_3d_handles_keyframes_edges_vertices_and_multiple_sources() {
+        let renderer = LayoutRenderer3d::new(octahedron_layout());
+        let top = state3(0.0, 0.0, 1.0, 0.75);
+        let trajectory = SourceTrajectory3d::new(vec![
+            segment3(0, 4, state3(0.0, 1.0, 0.0, 0.5), top),
+            segment3(4, 8, top, state3(0.0, -1.0, 0.0, 1.0)),
+        ])
+        .unwrap();
+        assert_eq!(trajectory.evaluate(4).unwrap(), top);
+        let samples = [1.0; 9];
+        let first =
+            TrajectorySourceBlock3d::new(SourceId::new(292), &samples, &trajectory, 0).unwrap();
+        let second_samples = [0.5; 9];
+        let second =
+            TrajectorySourceBlock3d::new(SourceId::new(293), &second_samples, &trajectory, 0)
+                .unwrap();
+        let combined = render_trajectory3(&renderer, &[first, second], samples.len());
+        let first_only = render_trajectory3(
+            &renderer,
+            &[TrajectorySourceBlock3d::new(SourceId::new(292), &samples, &trajectory, 0).unwrap()],
+            samples.len(),
+        );
+        let second_only = render_trajectory3(
+            &renderer,
+            &[
+                TrajectorySourceBlock3d::new(SourceId::new(293), &second_samples, &trajectory, 0)
+                    .unwrap(),
+            ],
+            samples.len(),
+        );
+        for speaker in 0..combined.len() {
+            for sample in 0..samples.len() {
+                assert_eq!(
+                    combined[speaker][sample],
+                    first_only[speaker][sample] + second_only[speaker][sample]
+                );
+            }
+        }
+        let vertex = renderer
+            .layout()
+            .gains(CartesianPosition::new(0.0, 0.0, 1.0))
+            .unwrap();
+        let mut vertex_full = [0.0; 6];
+        vertex.write_full_gains(&mut vertex_full).unwrap();
+        assert_eq!(vertex_full, [0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn trajectory_3d_rejects_antipodes_and_bad_or_atomic_ranges() {
+        let front = state3(0.0, 1.0, 0.0, 1.0);
+        let rear = state3(0.0, -1.0, 0.0, 1.0);
+        assert!(matches!(
+            TrajectorySegment3d::new(0, 4, front, rear),
+            Err(RenderError::AmbiguousAntipodal3dPath)
+        ));
+        let near_antipode = state3(1.0e-12, -1.0, 0.0, 1.0);
+        assert!(matches!(
+            TrajectorySegment3d::new(0, 4, front, near_antipode),
+            Err(RenderError::AmbiguousAntipodal3dPath)
+        ));
+
+        let first = segment3(0, 4, front, state3(0.0, 0.0, 1.0, 1.0));
+        let gap = segment3(5, 8, state3(0.0, 0.0, 1.0, 1.0), rear);
+        assert!(matches!(
+            SourceTrajectory3d::new(vec![first, gap]),
+            Err(RenderError::NonContiguousTrajectory { .. })
+        ));
+        assert!(matches!(
+            TrajectorySegment3d::new(0, MAX_EXACT_INTERPOLATION_SPAN + 1, front, rear),
+            Err(RenderError::TrajectorySpanTooLarge { .. })
+        ));
+
+        let partial = SpeakerLayout3d::new(
+            vec![
+                speaker3(294, 1.0, 0.0, 0.0),
+                speaker3(295, 0.0, 1.0, 0.0),
+                speaker3(296, 0.0, 0.0, 1.0),
+            ],
+            vec![triplet(294, 295, 296)],
+        )
+        .unwrap();
+        let renderer = LayoutRenderer3d::new(partial);
+        let trajectory =
+            SourceTrajectory3d::new(vec![segment3(0, 2, front, state3(-1.0, 0.0, 0.0, 1.0))])
+                .unwrap();
+        let source =
+            TrajectorySourceBlock3d::new(SourceId::new(297), &[1.0, 1.0, 1.0], &trajectory, 0)
+                .unwrap();
+        let mut outputs = vec![vec![7.0; 3]; 3];
+        let mut refs: Vec<&mut [f64]> = outputs.iter_mut().map(Vec::as_mut_slice).collect();
+        assert!(matches!(
+            renderer.render_trajectory_block(&[source], &mut refs),
+            Err(RenderError::Unsupported3dDirection { .. })
+        ));
+        assert_eq!(outputs, vec![vec![7.0; 3]; 3]);
+
+        let first =
+            TrajectorySourceBlock3d::new(SourceId::new(298), &[1.0, 1.0, 1.0], &trajectory, 0)
+                .unwrap();
+        let duplicate =
+            TrajectorySourceBlock3d::new(SourceId::new(298), &[1.0, 1.0, 1.0], &trajectory, 0)
+                .unwrap();
+        let mut unchanged = vec![vec![9.0; 3]; 6];
+        let mut refs: Vec<&mut [f64]> = unchanged.iter_mut().map(Vec::as_mut_slice).collect();
+        let duplicate_result = LayoutRenderer3d::new(octahedron_layout())
+            .render_trajectory_block(&[first, duplicate], &mut refs);
+        assert!(matches!(
+            duplicate_result,
+            Err(RenderError::DuplicateSourceId { .. })
+        ));
+        assert_eq!(unchanged, vec![vec![9.0; 3]; 6]);
+    }
+
+    #[test]
+    fn binaural_hrir_validation_and_exact_direction_lookup_are_strict() {
+        assert!(matches!(
+            HrirPair::new(0, vec![1.0], vec![1.0]),
+            Err(RenderError::InvalidSampleRate)
+        ));
+        assert!(matches!(
+            HrirPair::new(48_000, Vec::new(), vec![1.0]),
+            Err(RenderError::EmptyHrir)
+        ));
+        assert!(matches!(
+            HrirPair::new(48_000, vec![1.0], vec![1.0, 2.0]),
+            Err(RenderError::MismatchedHrirTapLength { .. })
+        ));
+        assert!(matches!(
+            HrirPair::new(48_000, vec![f64::NAN], vec![1.0]),
+            Err(RenderError::NonFiniteHrirTap {
+                ear: HrirEar::Left,
+                ..
+            })
+        ));
+        let duplicate_id = vec![
+            hrir_entry_test(10, CartesianPosition::new(0.0, 1.0, 0.0), &[1.0], &[1.0]),
+            hrir_entry_test(10, CartesianPosition::new(1.0, 0.0, 0.0), &[1.0], &[1.0]),
+        ];
+        assert!(matches!(
+            HrirBank::new(48_000, duplicate_id),
+            Err(RenderError::DuplicateHrirEntryId { .. })
+        ));
+        let duplicate_direction = vec![
+            hrir_entry_test(11, CartesianPosition::new(0.0, 1.0, 0.0), &[1.0], &[1.0]),
+            hrir_entry_test(
+                12,
+                CartesianPosition::new(0.0, 1.0 + 1.0e-8, 0.0),
+                &[1.0],
+                &[1.0],
+            ),
+        ];
+        assert_eq!(
+            HrirBank::new(48_000, duplicate_direction).unwrap_err(),
+            RenderError::DuplicateHrirDirection {
+                first: 0,
+                second: 1,
+            }
+        );
+        let close_directions = vec![
+            hrir_entry_test(
+                13,
+                CartesianPosition::new(0.000_000_999_95, 1.0, 0.0),
+                &[1.0],
+                &[1.0],
+            ),
+            hrir_entry_test(
+                14,
+                CartesianPosition::new(0.000_001_000_15, 1.0, 0.0),
+                &[1.0],
+                &[1.0],
+            ),
+        ];
+        assert_eq!(
+            HrirBank::new(48_000, close_directions).unwrap_err(),
+            RenderError::DuplicateHrirDirection {
+                first: 0,
+                second: 1,
+            }
+        );
+        let same_x_plane = (0..4_096)
+            .map(|index| {
+                let angle = std::f64::consts::TAU * index as f64 / 4_096.0;
+                hrir_entry_test(
+                    u64::try_from(index).expect("range index must be non-negative") + 100,
+                    CartesianPosition::new(0.0, angle.cos(), angle.sin()),
+                    &[1.0],
+                    &[1.0],
+                )
+            })
+            .collect();
+        assert_eq!(
+            HrirBank::new(48_000, same_x_plane).unwrap().entries().len(),
+            4_096
+        );
+        let bank = binaural_test_bank();
+        assert_eq!(
+            bank.resolve_exact(CartesianPosition::new(0.0, 1.0, 0.0))
+                .unwrap()
+                .id(),
+            HrirEntryId::new(1)
+        );
+        assert!(matches!(
+            bank.resolve_exact(CartesianPosition::new(0.0, 0.0, 1.0)),
+            Err(RenderError::UnsupportedHrirDirection { .. })
+        ));
+        assert!(matches!(
+            BinauralRenderer::new(
+                44_100,
+                bank,
+                vec![
+                    StaticBinauralSource::new(
+                        SourceId::new(1),
+                        CartesianPosition::new(0.0, 1.0, 0.0),
+                        1.0,
+                        HrirEntryId::new(1),
+                    )
+                    .unwrap()
+                ],
+            ),
+            Err(RenderError::HrirSampleRateMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn binaural_direct_fir_matches_independent_oracle_and_preserves_ear_delay() {
+        let bank = binaural_test_bank();
+        let source = StaticBinauralSource::new(
+            SourceId::new(20),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            2.0,
+            HrirEntryId::new(1),
+        )
+        .unwrap();
+        let samples = [1.0, -0.5, 0.25];
+        let mut renderer = BinauralRenderer::new(48_000, bank, vec![source]).unwrap();
+        assert_eq!(
+            renderer.hrir_tap_storage_bytes(),
+            8 * std::mem::size_of::<f64>()
+        );
+        let (left, right) = render_binaural_partitioned(
+            &mut renderer,
+            &[(&samples, SourceId::new(20))],
+            &[3],
+            &[1, 1],
+        );
+        let expected_left = oracle_full_convolution(&samples, 2.0, &[0.0, 1.0, 0.5]);
+        let expected_right = oracle_full_convolution(&samples, 2.0, &[0.0, 0.25, -0.5]);
+        assert_eq!(left, expected_left);
+        assert_eq!(right, expected_right);
+        assert_ne!(left, right);
+        assert_eq!(renderer.remaining_tail_samples(), 0);
+        assert!(renderer.is_finished());
+    }
+
+    #[test]
+    fn binaural_static_tap_ranges_match_old_loop_at_current_history_boundaries() {
+        for tap_count in [1, 2, 3, 15, 16, 17] {
+            let left_taps = (0..tap_count)
+                .map(|tap| 0.1 / (tap as f64 + 1.0))
+                .collect::<Vec<_>>();
+            let right_taps = (0..tap_count)
+                .map(|tap| -0.3 / (tap as f64 + 1.0))
+                .collect::<Vec<_>>();
+            let direction = CartesianPosition::new(0.0, 1.0, 0.0);
+            let bank = HrirBank::new(
+                48_000,
+                vec![hrir_entry_test(1, direction, &left_taps, &right_taps)],
+            )
+            .unwrap();
+            let source =
+                StaticBinauralSource::new(SourceId::new(1), direction, -0.7, HrirEntryId::new(1))
+                    .unwrap();
+            let mut original = BinauralRenderer::new(48_000, bank.clone(), vec![source]).unwrap();
+            let mut candidate = BinauralRenderer::new(48_000, bank, vec![source]).unwrap();
+            // Repeated blocks exercise both zero and populated history, with
+            // the split before, at, and after the final tap in each block.
+            for length in [1, 0, tap_count - 1, tap_count, tap_count + 1, 1] {
+                let samples = (0..length)
+                    .map(|index| [1.0e16, 1.0, -1.0e16, 0.1, -0.0][index % 5])
+                    .collect::<Vec<_>>();
+                let blocks = [BinauralSourceBlock::new(SourceId::new(1), &samples)];
+                let mut original_left = vec![0.0; length];
+                let mut original_right = vec![0.0; length];
+                let mut candidate_left = vec![0.0; length];
+                let mut candidate_right = vec![0.0; length];
+                let expected = render_block_original_loop(
+                    &mut original,
+                    &blocks,
+                    &mut original_left,
+                    &mut original_right,
+                );
+                let actual =
+                    candidate.render_block(&blocks, &mut candidate_left, &mut candidate_right);
+                assert_eq!(expected, actual);
+                assert_f64_slice_bits(&original_left, &candidate_left, "tap boundary left");
+                assert_f64_slice_bits(&original_right, &candidate_right, "tap boundary right");
+                assert_binaural_state_bits(&original, &candidate);
+            }
+        }
+    }
+
+    #[test]
+    fn binaural_local_accumulators_match_old_loop_for_long_cancellation_sensitive_filters() {
+        let tap_lengths = [255, 256, 257, 2, 1];
+        let directions = [
+            CartesianPosition::new(1.0, 0.0, 0.0),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            CartesianPosition::new(0.0, 0.0, 1.0),
+            CartesianPosition::new(1.0, 1.0, 0.0),
+            CartesianPosition::new(-1.0, 1.0, 0.0),
+        ];
+        let gains = [1.1, -0.7, 0.3, 0.0, -0.0];
+        let mut entries = Vec::new();
+        let mut sources = Vec::new();
+        for source_index in 0..tap_lengths.len() {
+            let tap_count = tap_lengths[source_index];
+            let left_taps = (0..tap_count)
+                .map(|tap| 0.1 / (tap as f64 + 1.0) + source_index as f64 * 1.0e-10)
+                .collect::<Vec<_>>();
+            let right_taps = (0..tap_count)
+                .map(|tap| -0.3 / (tap as f64 + 1.0) - source_index as f64 * 1.0e-10)
+                .collect::<Vec<_>>();
+            let id = SourceId::new(301 + source_index as u64);
+            let entry_id = HrirEntryId::new(301 + source_index as u64);
+            entries.push(hrir_entry_test(
+                entry_id.get(),
+                directions[source_index],
+                &left_taps,
+                &right_taps,
+            ));
+            sources.push(
+                StaticBinauralSource::new(
+                    id,
+                    directions[source_index],
+                    gains[source_index],
+                    entry_id,
+                )
+                .unwrap(),
+            );
+        }
+        let bank = HrirBank::new(48_000, entries).unwrap();
+        let mut original = BinauralRenderer::new(48_000, bank.clone(), sources.clone()).unwrap();
+        let mut candidate = BinauralRenderer::new(48_000, bank.clone(), sources.clone()).unwrap();
+        assert_binaural_state_bits(&original, &candidate);
+
+        let inputs = (0..tap_lengths.len())
+            .map(|source_index| {
+                (0..850)
+                    .map(|sample_index| match (sample_index + source_index) % 8 {
+                        0 => 1.0e16,
+                        1 => 1.0,
+                        2 => -1.0e16,
+                        3 => 0.1,
+                        4 => -0.1,
+                        5 => f64::from_bits(0x3ff0_0000_0000_0001),
+                        6 => -0.0,
+                        _ => 0.375,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..tap_lengths.len())
+            .map(|index| SourceId::new(301 + index as u64))
+            .collect::<Vec<_>>();
+        let make_blocks = |start: usize, length: usize, reverse: bool| {
+            let mut blocks: Vec<_> = ids
+                .iter()
+                .zip(&inputs)
+                .map(|(&id, samples)| BinauralSourceBlock::new(id, &samples[start..start + length]))
+                .collect();
+            if reverse {
+                blocks.reverse();
+            }
+            blocks
+        };
+
+        // The 127/128-sample chunks are below every history length; 256 and
+        // 336 cross the shorter histories and the longest 256-sample history.
+        let chunk_lengths = [1, 127, 128, 256, 2, 0, 336];
+        let mut offset = 0;
+        for &length in &chunk_lengths {
+            let reference_blocks = make_blocks(offset, length, false);
+            let candidate_blocks = make_blocks(offset, length, true);
+            let mut original_left = vec![0.0; length];
+            let mut original_right = vec![0.0; length];
+            let mut candidate_left = vec![0.0; length];
+            let mut candidate_right = vec![0.0; length];
+            let reference_result = render_block_original_loop(
+                &mut original,
+                &reference_blocks,
+                &mut original_left,
+                &mut original_right,
+            );
+            let candidate_result = candidate.render_block(
+                &candidate_blocks,
+                &mut candidate_left,
+                &mut candidate_right,
+            );
+            assert_eq!(reference_result, candidate_result);
+            assert_f64_slice_bits(&original_left, &candidate_left, "long chunk left");
+            assert_f64_slice_bits(&original_right, &candidate_right, "long chunk right");
+            assert_binaural_state_bits(&original, &candidate);
+            offset += length;
+        }
+        assert_eq!(offset, 850);
+        assert_eq!(original.remaining_tail_samples(), 256);
+
+        // Duplicate-source validation wins over the later NaN check and must
+        // leave caller outputs plus renderer history unchanged.
+        let mut invalid_original =
+            BinauralRenderer::new(48_000, bank.clone(), sources.clone()).unwrap();
+        let mut invalid_candidate = BinauralRenderer::new(48_000, bank, sources).unwrap();
+        let valid_sample = [0.5];
+        let non_finite_sample = [f64::NAN];
+        let invalid_blocks = [
+            BinauralSourceBlock::new(SourceId::new(301), &valid_sample),
+            BinauralSourceBlock::new(SourceId::new(301), &non_finite_sample),
+            BinauralSourceBlock::new(SourceId::new(303), &valid_sample),
+            BinauralSourceBlock::new(SourceId::new(304), &valid_sample),
+            BinauralSourceBlock::new(SourceId::new(305), &valid_sample),
+        ];
+        let mut invalid_original_left = [3.0];
+        let mut invalid_original_right = [-4.0];
+        let mut invalid_candidate_left = [3.0];
+        let mut invalid_candidate_right = [-4.0];
+        let reference_result = render_block_original_loop(
+            &mut invalid_original,
+            &invalid_blocks,
+            &mut invalid_original_left,
+            &mut invalid_original_right,
+        );
+        let candidate_result = invalid_candidate.render_block(
+            &invalid_blocks,
+            &mut invalid_candidate_left,
+            &mut invalid_candidate_right,
+        );
+        assert_eq!(
+            reference_result,
+            Err(RenderError::DuplicateBinauralSource {
+                id: SourceId::new(301)
+            })
+        );
+        assert_eq!(reference_result, candidate_result);
+        assert_f64_slice_bits(
+            &invalid_original_left,
+            &invalid_candidate_left,
+            "invalid long left",
+        );
+        assert_f64_slice_bits(
+            &invalid_original_right,
+            &invalid_candidate_right,
+            "invalid long right",
+        );
+        assert_binaural_state_bits(&invalid_original, &invalid_candidate);
+
+        for length in [128, 128] {
+            let mut original_left = vec![0.0; length];
+            let mut original_right = vec![0.0; length];
+            let mut candidate_left = vec![0.0; length];
+            let mut candidate_right = vec![0.0; length];
+            let reference_result =
+                original.drain_tail_block(&mut original_left, &mut original_right);
+            let candidate_result =
+                candidate.drain_tail_block(&mut candidate_left, &mut candidate_right);
+            assert_eq!(reference_result, candidate_result);
+            assert_f64_slice_bits(&original_left, &candidate_left, "long tail left");
+            assert_f64_slice_bits(&original_right, &candidate_right, "long tail right");
+            assert_binaural_state_bits(&original, &candidate);
+        }
+        assert!(original.is_finished());
+        original.reset();
+        candidate.reset();
+        assert_binaural_state_bits(&original, &candidate);
+        let reference_blocks = make_blocks(0, 1, false);
+        let candidate_blocks = make_blocks(0, 1, true);
+        let mut original_left = [0.0];
+        let mut original_right = [0.0];
+        let mut candidate_left = [0.0];
+        let mut candidate_right = [0.0];
+        let reference_result = render_block_original_loop(
+            &mut original,
+            &reference_blocks,
+            &mut original_left,
+            &mut original_right,
+        );
+        let candidate_result =
+            candidate.render_block(&candidate_blocks, &mut candidate_left, &mut candidate_right);
+        assert_eq!(reference_result, candidate_result);
+        assert_f64_slice_bits(&original_left, &candidate_left, "long post-reset left");
+        assert_f64_slice_bits(&original_right, &candidate_right, "long post-reset right");
+        assert_binaural_state_bits(&original, &candidate);
+    }
+
+    #[test]
+    fn binaural_local_accumulators_preserve_overflow_error_precedence_and_reset() {
+        let bank = HrirBank::new(
+            48_000,
+            vec![hrir_entry_test(
+                99,
+                CartesianPosition::new(0.0, 1.0, 0.0),
+                &[f64::MAX],
+                &[f64::MAX],
+            )],
+        )
+        .unwrap();
+        let source = StaticBinauralSource::new(
+            SourceId::new(90),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            2.0,
+            HrirEntryId::new(99),
+        )
+        .unwrap();
+        let mut original = BinauralRenderer::new(48_000, bank.clone(), vec![source]).unwrap();
+        let mut candidate = BinauralRenderer::new(48_000, bank, vec![source]).unwrap();
+        let huge_sample = [f64::MAX];
+        let blocks = [BinauralSourceBlock::new(SourceId::new(90), &huge_sample)];
+        let mut original_left = [7.0];
+        let mut original_right = [8.0];
+        let mut candidate_left = [7.0];
+        let mut candidate_right = [8.0];
+        let reference_result = render_block_original_loop(
+            &mut original,
+            &blocks,
+            &mut original_left,
+            &mut original_right,
+        );
+        let candidate_result =
+            candidate.render_block(&blocks, &mut candidate_left, &mut candidate_right);
+        assert_eq!(
+            reference_result,
+            Err(RenderError::NonFiniteOutput {
+                channel: OutputChannel::Left,
+                sample_index: 0,
+            })
+        );
+        assert_eq!(reference_result, candidate_result);
+        assert_f64_slice_bits(&original_left, &candidate_left, "overflow left output");
+        assert_f64_slice_bits(&original_right, &candidate_right, "overflow right output");
+        assert_binaural_state_bits(&original, &candidate);
+        assert!(original.requires_reset);
+
+        // requires_reset must win before output-length/structural validation.
+        let malformed: [BinauralSourceBlock<'_>; 0] = [];
+        let mut original_bad_left = [3.0; 2];
+        let mut original_bad_right = [4.0; 1];
+        let mut candidate_bad_left = [3.0; 2];
+        let mut candidate_bad_right = [4.0; 1];
+        let reference_result = render_block_original_loop(
+            &mut original,
+            &malformed,
+            &mut original_bad_left,
+            &mut original_bad_right,
+        );
+        let candidate_result = candidate.render_block(
+            &malformed,
+            &mut candidate_bad_left,
+            &mut candidate_bad_right,
+        );
+        assert_eq!(reference_result, Err(RenderError::BinauralRequiresReset));
+        assert_eq!(reference_result, candidate_result);
+        assert_f64_slice_bits(
+            &original_bad_left,
+            &candidate_bad_left,
+            "reset-required left",
+        );
+        assert_f64_slice_bits(
+            &original_bad_right,
+            &candidate_bad_right,
+            "reset-required right",
+        );
+        assert_binaural_state_bits(&original, &candidate);
+
+        original.reset();
+        candidate.reset();
+        assert_binaural_state_bits(&original, &candidate);
+        let zero_sample = [0.0];
+        let recovery_blocks = [BinauralSourceBlock::new(SourceId::new(90), &zero_sample)];
+        let mut original_left = [1.0];
+        let mut original_right = [2.0];
+        let mut candidate_left = [1.0];
+        let mut candidate_right = [2.0];
+        let reference_result = render_block_original_loop(
+            &mut original,
+            &recovery_blocks,
+            &mut original_left,
+            &mut original_right,
+        );
+        let candidate_result =
+            candidate.render_block(&recovery_blocks, &mut candidate_left, &mut candidate_right);
+        assert_eq!(reference_result, Ok(()));
+        assert_eq!(reference_result, candidate_result);
+        assert_f64_slice_bits(&original_left, &candidate_left, "recovery left output");
+        assert_f64_slice_bits(&original_right, &candidate_right, "recovery right output");
+        assert_binaural_state_bits(&original, &candidate);
+
+        // Right-only non-finite output is distinct from the both-ears overflow
+        // above: the left channel must stay finite and the error names right.
+        let right_only_bank = HrirBank::new(
+            48_000,
+            vec![hrir_entry_test(
+                100,
+                CartesianPosition::new(0.0, 1.0, 0.0),
+                &[1.0],
+                &[f64::MAX],
+            )],
+        )
+        .unwrap();
+        let right_only_source = StaticBinauralSource::new(
+            SourceId::new(91),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            1.0,
+            HrirEntryId::new(100),
+        )
+        .unwrap();
+        let mut right_original =
+            BinauralRenderer::new(48_000, right_only_bank.clone(), vec![right_only_source])
+                .unwrap();
+        let mut right_candidate =
+            BinauralRenderer::new(48_000, right_only_bank, vec![right_only_source]).unwrap();
+        let right_huge_sample = [f64::MAX];
+        let right_blocks = [BinauralSourceBlock::new(
+            SourceId::new(91),
+            &right_huge_sample,
+        )];
+        let mut right_original_left = [2.0];
+        let mut right_original_right = [3.0];
+        let mut right_candidate_left = [2.0];
+        let mut right_candidate_right = [3.0];
+        let right_reference_result = render_block_original_loop(
+            &mut right_original,
+            &right_blocks,
+            &mut right_original_left,
+            &mut right_original_right,
+        );
+        let right_candidate_result = right_candidate.render_block(
+            &right_blocks,
+            &mut right_candidate_left,
+            &mut right_candidate_right,
+        );
+        assert_eq!(
+            right_reference_result,
+            Err(RenderError::NonFiniteOutput {
+                channel: OutputChannel::Right,
+                sample_index: 0,
+            })
+        );
+        assert_eq!(right_reference_result, right_candidate_result);
+        assert_f64_slice_bits(
+            &right_original_left,
+            &right_candidate_left,
+            "right-only overflow left output",
+        );
+        assert_f64_slice_bits(
+            &right_original_right,
+            &right_candidate_right,
+            "right-only overflow right output",
+        );
+        assert_binaural_state_bits(&right_original, &right_candidate);
+    }
+
+    #[test]
+    fn binaural_renderer_separates_front_rear_top_left_and_right_causally() {
+        let bank = HrirBank::new(
+            48_000,
+            vec![
+                hrir_entry_test(31, CartesianPosition::new(0.0, 1.0, 0.0), &[1.0], &[0.5]),
+                hrir_entry_test(32, CartesianPosition::new(0.0, -1.0, 0.0), &[0.25], &[1.0]),
+                hrir_entry_test(33, CartesianPosition::new(0.0, 0.0, 1.0), &[0.75], &[0.75]),
+                hrir_entry_test(34, CartesianPosition::new(-1.0, 0.0, 0.0), &[1.25], &[0.0]),
+                hrir_entry_test(35, CartesianPosition::new(1.0, 0.0, 0.0), &[0.0], &[1.25]),
+            ],
+        )
+        .unwrap();
+        let positions = [
+            (
+                31,
+                CartesianPosition::new(0.0, 1.0, 0.0),
+                HrirEntryId::new(31),
+            ),
+            (
+                32,
+                CartesianPosition::new(0.0, -1.0, 0.0),
+                HrirEntryId::new(32),
+            ),
+            (
+                33,
+                CartesianPosition::new(0.0, 0.0, 1.0),
+                HrirEntryId::new(33),
+            ),
+            (
+                34,
+                CartesianPosition::new(-1.0, 0.0, 0.0),
+                HrirEntryId::new(34),
+            ),
+            (
+                35,
+                CartesianPosition::new(1.0, 0.0, 0.0),
+                HrirEntryId::new(35),
+            ),
+        ];
+        let mut fingerprints = Vec::new();
+        for (id, direction, entry_id) in positions {
+            let source =
+                StaticBinauralSource::new(SourceId::new(id), direction, 1.0, entry_id).unwrap();
+            let mut renderer = BinauralRenderer::new(48_000, bank.clone(), vec![source]).unwrap();
+            let mut left = [0.0];
+            let mut right = [0.0];
+            renderer
+                .render_block(
+                    &[BinauralSourceBlock::new(SourceId::new(id), &[1.0])],
+                    &mut left,
+                    &mut right,
+                )
+                .unwrap();
+            assert!(left[0].is_finite() && right[0].is_finite());
+            fingerprints.push([left[0], right[0]]);
+        }
+
+        assert_ne!(fingerprints[0], fingerprints[1]);
+        assert_ne!(fingerprints[0], fingerprints[2]);
+        assert_ne!(fingerprints[3], fingerprints[4]);
+    }
+
+    #[test]
+    fn binaural_input_and_tail_partitions_are_byte_identical_for_multiple_sources() {
+        let samples_a = [1.0, 0.5, -0.25, 0.75, 0.0];
+        let samples_b = [-0.5, 0.25, 0.5, -0.75, 1.0];
+        let source_a = StaticBinauralSource::new(
+            SourceId::new(21),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            0.75,
+            HrirEntryId::new(1),
+        )
+        .unwrap();
+        let source_b = StaticBinauralSource::new(
+            SourceId::new(22),
+            CartesianPosition::new(-1.0, 1.0, 0.0),
+            -0.5,
+            HrirEntryId::new(2),
+        )
+        .unwrap();
+        let make_renderer = || {
+            BinauralRenderer::new(48_000, binaural_test_bank(), vec![source_a, source_b]).unwrap()
+        };
+        let blocks = [
+            (&samples_a[..], SourceId::new(21)),
+            (&samples_b[..], SourceId::new(22)),
+        ];
+        let whole = render_binaural_partitioned(&mut make_renderer(), &blocks, &[5], &[2]);
+        let irregular =
+            render_binaural_partitioned(&mut make_renderer(), &blocks, &[1, 2, 1, 1], &[1, 1]);
+        let one_sample =
+            render_binaural_partitioned(&mut make_renderer(), &blocks, &[1, 1, 1, 1, 1], &[1, 1]);
+        assert_eq!(whole, irregular);
+        assert_eq!(whole, one_sample);
+    }
+
+    #[test]
+    fn binaural_history_reset_and_failure_paths_are_bounded_and_atomic() {
+        let source = StaticBinauralSource::new(
+            SourceId::new(23),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            1.0,
+            HrirEntryId::new(1),
+        )
+        .unwrap();
+        let samples = [1.0, 2.0, 3.0, 4.0];
+        let mut split = BinauralRenderer::new(48_000, binaural_test_bank(), vec![source]).unwrap();
+        let first = BinauralSourceBlock::new(SourceId::new(23), &samples[..2]);
+        let second = BinauralSourceBlock::new(SourceId::new(23), &samples[2..]);
+        let mut left = [0.0; 2];
+        let mut right = [0.0; 2];
+        split.render_block(&[first], &mut left, &mut right).unwrap();
+        split
+            .render_block(&[second], &mut left, &mut right)
+            .unwrap();
+        let split_tail = split.remaining_tail_samples();
+        assert_eq!(split_tail, 2);
+        split.reset();
+        let reset_result = render_binaural_partitioned(
+            &mut split,
+            &[(&samples, SourceId::new(23))],
+            &[4],
+            &[1, 1],
+        );
+        let mut fresh = BinauralRenderer::new(48_000, binaural_test_bank(), vec![source]).unwrap();
+        let fresh_result = render_binaural_partitioned(
+            &mut fresh,
+            &[(&samples, SourceId::new(23))],
+            &[4],
+            &[1, 1],
+        );
+        assert_eq!(reset_result, fresh_result);
+
+        let mut atomic = BinauralRenderer::new(48_000, binaural_test_bank(), vec![source]).unwrap();
+        let mut unchanged_left = [9.0; 4];
+        let mut unchanged_right = [8.0; 4];
+        let unknown = BinauralSourceBlock::new(SourceId::new(999), &samples);
+        assert!(matches!(
+            atomic.render_block(&[unknown], &mut unchanged_left, &mut unchanged_right),
+            Err(RenderError::UnknownBinauralSource { .. })
+        ));
+        assert_eq!(unchanged_left, [9.0; 4]);
+        assert_eq!(unchanged_right, [8.0; 4]);
+        let valid = BinauralSourceBlock::new(SourceId::new(23), &samples);
+        atomic
+            .render_block(&[valid], &mut unchanged_left, &mut unchanged_right)
+            .unwrap();
+
+        let huge_pair = HrirPair::new(48_000, vec![f64::MAX], vec![f64::MAX]).unwrap();
+        let huge_bank = HrirBank::new(
+            48_000,
+            vec![
+                HrirEntry::new(
+                    HrirEntryId::new(99),
+                    CartesianPosition::new(0.0, 1.0, 0.0),
+                    huge_pair,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let huge_source = StaticBinauralSource::new(
+            SourceId::new(24),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            1.0,
+            HrirEntryId::new(99),
+        )
+        .unwrap();
+        let mut overflow = BinauralRenderer::new(48_000, huge_bank, vec![huge_source]).unwrap();
+        let mut overflow_left = [7.0];
+        let mut overflow_right = [8.0];
+        assert!(matches!(
+            overflow.render_block(
+                &[BinauralSourceBlock::new(SourceId::new(24), &[f64::MAX])],
+                &mut overflow_left,
+                &mut overflow_right,
+            ),
+            Err(RenderError::NonFiniteOutput { .. })
+        ));
+        assert_eq!(overflow_left, [0.0]);
+        assert_eq!(overflow_right, [0.0]);
+        assert!(matches!(
+            overflow.render_block(
+                &[BinauralSourceBlock::new(SourceId::new(24), &[0.0])],
+                &mut overflow_left,
+                &mut overflow_right,
+            ),
+            Err(RenderError::BinauralRequiresReset)
+        ));
+    }
+
+    #[test]
+    fn binaural_one_tap_has_zero_tail_and_rejects_input_after_drain() {
+        let bank = HrirBank::new(
+            48_000,
+            vec![hrir_entry_test(
+                30,
+                CartesianPosition::new(0.0, 1.0, 0.0),
+                &[1.0],
+                &[0.5],
+            )],
+        )
+        .unwrap();
+        let source = StaticBinauralSource::new(
+            SourceId::new(30),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            1.0,
+            HrirEntryId::new(30),
+        )
+        .unwrap();
+        let mut renderer = BinauralRenderer::new(48_000, bank, vec![source]).unwrap();
+        let mut left = [0.0; 2];
+        let mut right = [0.0; 2];
+        renderer
+            .render_block(
+                &[BinauralSourceBlock::new(SourceId::new(30), &[1.0, 2.0])],
+                &mut left,
+                &mut right,
+            )
+            .unwrap();
+        assert_eq!(renderer.remaining_tail_samples(), 0);
+        renderer.drain_tail_block(&mut [], &mut []).unwrap();
+        assert!(renderer.is_finished());
+        assert!(matches!(
+            renderer.render_block(
+                &[BinauralSourceBlock::new(SourceId::new(30), &[0.0])],
+                &mut [],
+                &mut [],
+            ),
+            Err(RenderError::BinauralInputAfterTailStart)
+        ));
+    }
+
+    #[test]
+    fn direct_3d_matrix_oracle_solves_identity_without_renderer() {
+        let result = solve_3x3_for(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.25, -0.5, 0.75],
+        )
+        .unwrap();
+        assert_eq!(result, [0.25, -0.5, 0.75]);
+    }
+
+    #[test]
+    fn vbap_3d_matches_independent_axis_oracle_and_normalizes_energy() {
+        let layout = SpeakerLayout3d::new(
+            vec![
+                speaker3(210, 1.0, 0.0, 0.0),
+                speaker3(211, 0.0, 1.0, 0.0),
+                speaker3(212, 0.0, 0.0, 1.0),
+            ],
+            vec![triplet(210, 211, 212)],
+        )
+        .unwrap();
+        let gains = layout.gains(CartesianPosition::new(1.0, 2.0, 3.0)).unwrap();
+        let norm = 14.0_f64.sqrt();
+        assert_eq!(gains.triplet(), Some(triplet(210, 211, 212)));
+        assert!((gains.first() - 1.0 / norm).abs() <= EPSILON);
+        assert!((gains.second() - 2.0 / norm).abs() <= EPSILON);
+        assert!((gains.third() - 3.0 / norm).abs() <= EPSILON);
+        assert!((gains.gains().iter().map(|gain| gain * gain).sum::<f64>() - 1.0).abs() <= EPSILON);
+        let mut full = [99.0; 3];
+        gains.write_full_gains(&mut full).unwrap();
+        assert_eq!(full, [gains.first(), gains.second(), gains.third()]);
+
+        let reordered = SpeakerLayout3d::new(
+            vec![
+                speaker3(212, 0.0, 0.0, 1.0),
+                speaker3(210, 1.0, 0.0, 0.0),
+                speaker3(211, 0.0, 1.0, 0.0),
+            ],
+            vec![triplet(212, 210, 211)],
+        )
+        .unwrap();
+        let reordered_gains = reordered
+            .gains(CartesianPosition::new(1.0, 2.0, 3.0))
+            .unwrap();
+        let mut reordered_full = [0.0; 3];
+        reordered_gains
+            .write_full_gains(&mut reordered_full)
+            .unwrap();
+        assert_eq!(
+            reordered_full,
+            [gains.third(), gains.first(), gains.second()]
+        );
+    }
+
+    #[test]
+    fn exact_cardinal_3d_hits_are_deterministic_one_hot_gains() {
+        let layout = octahedron_layout();
+        for (index, position) in [
+            CartesianPosition::new(1.0, 0.0, 0.0),
+            CartesianPosition::new(-1.0, 0.0, 0.0),
+            CartesianPosition::new(0.0, 1.0, 0.0),
+            CartesianPosition::new(0.0, -1.0, 0.0),
+            CartesianPosition::new(0.0, 0.0, 1.0),
+            CartesianPosition::new(0.0, 0.0, -1.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let gains = layout.gains(position).unwrap();
+            let mut full = [0.0; 6];
+            gains.write_full_gains(&mut full).unwrap();
+            assert_eq!(full[index], 1.0);
+            assert_eq!(full.iter().filter(|value| **value != 0.0).count(), 1);
+        }
+    }
+
+    #[test]
+    fn tetrahedron_faces_and_shared_edges_are_continuous() {
+        let scale = 3.0_f64.sqrt();
+        let layout = SpeakerLayout3d::new(
+            vec![
+                speaker3(220, 1.0, 1.0, 1.0),
+                speaker3(221, -1.0, -1.0, 1.0),
+                speaker3(222, -1.0, 1.0, -1.0),
+                speaker3(223, 1.0, -1.0, -1.0),
+            ],
+            vec![
+                triplet(220, 221, 222),
+                triplet(220, 223, 221),
+                triplet(220, 222, 223),
+                triplet(221, 223, 222),
+            ],
+        )
+        .unwrap();
+        for position in [
+            CartesianPosition::new(-1.0, 1.0, 1.0),
+            CartesianPosition::new(1.0, -1.0, 1.0),
+            CartesianPosition::new(-1.0, -1.0, -1.0),
+            CartesianPosition::new(1.0, 1.0, -1.0),
+        ] {
+            let gains = layout.gains(position).unwrap();
+            assert!(
+                gains
+                    .gains()
+                    .iter()
+                    .all(|gain| (*gain - 1.0 / scale).abs() <= EPSILON)
+            );
+        }
+        let edge = layout.gains(CartesianPosition::new(0.0, 0.0, 1.0)).unwrap();
+        assert!((edge.first() - 2.0_f64.sqrt().recip()).abs() <= EPSILON);
+        assert!((edge.second() - 2.0_f64.sqrt().recip()).abs() <= EPSILON);
+        assert!(edge.third().abs() <= EPSILON);
+    }
+
+    #[test]
+    fn irregular_closed_topology_and_dense_face_sweep_are_deterministic() {
+        let first_direction = unit_direction(1.0, 0.2, 0.3);
+        let second_direction = unit_direction(-0.4, 1.0, 0.1);
+        let third_direction = unit_direction(0.2, -0.3, 1.0);
+        let fourth_direction = unit_direction(-0.8, -0.6, -0.7);
+        let layout = SpeakerLayout3d::new(
+            vec![
+                speaker3(224, first_direction.x, first_direction.y, first_direction.z),
+                speaker3(
+                    225,
+                    second_direction.x,
+                    second_direction.y,
+                    second_direction.z,
+                ),
+                speaker3(226, third_direction.x, third_direction.y, third_direction.z),
+                speaker3(
+                    227,
+                    fourth_direction.x,
+                    fourth_direction.y,
+                    fourth_direction.z,
+                ),
+            ],
+            vec![
+                triplet(224, 225, 226),
+                triplet(224, 227, 225),
+                triplet(224, 226, 227),
+                triplet(225, 227, 226),
+            ],
+        )
+        .unwrap();
+        for (first, second, third) in [
+            (first_direction, second_direction, third_direction),
+            (first_direction, fourth_direction, second_direction),
+            (first_direction, third_direction, fourth_direction),
+            (second_direction, fourth_direction, third_direction),
+        ] {
+            let gains = layout.gains(sum_positions(first, second, third)).unwrap();
+            assert!(
+                gains
+                    .gains()
+                    .iter()
+                    .all(|gain| (*gain - 1.0 / 3.0_f64.sqrt()).abs() <= EPSILON)
+            );
+        }
+        let faces = [
+            (first_direction, second_direction, third_direction),
+            (first_direction, fourth_direction, second_direction),
+            (first_direction, third_direction, fourth_direction),
+            (second_direction, fourth_direction, third_direction),
+        ];
+        let mut samples = 0;
+        for (first, second, third) in faces {
+            for i in 1..=8 {
+                for j in 1..=8 - i {
+                    let third_weight = 9 - i - j;
+                    let position = CartesianPosition::new(
+                        first.x * i as f64 + second.x * j as f64 + third.x * third_weight as f64,
+                        first.y * i as f64 + second.y * j as f64 + third.y * third_weight as f64,
+                        first.z * i as f64 + second.z * j as f64 + third.z * third_weight as f64,
+                    );
+                    let gains = layout.gains(position).unwrap();
+                    assert!(
+                        gains
+                            .gains()
+                            .iter()
+                            .all(|gain| gain.is_finite() && *gain >= 0.0)
+                    );
+                    assert!(
+                        (gains.gains().iter().map(|gain| gain * gain).sum::<f64>() - 1.0).abs()
+                            <= EPSILON
+                    );
+                    samples += 1;
+                }
+            }
+        }
+        assert_eq!(samples, 112);
+    }
+
+    #[test]
+    fn vertex_approaches_converge_to_one_hot_exact_speaker() {
+        let layout = octahedron_layout();
+        for position in [
+            CartesianPosition::new(1.0, 1.0e-6, 1.0e-6),
+            CartesianPosition::new(1.0, 1.0e-6, -1.0e-6),
+            CartesianPosition::new(1.0, -1.0e-6, 1.0e-6),
+            CartesianPosition::new(1.0, -1.0e-6, -1.0e-6),
+        ] {
+            let gains = full_gains(&layout, position);
+            assert!(gains[0] > 0.999999);
+            assert!(gains[1..].iter().all(|gain| *gain < 0.001));
+        }
+    }
+
+    #[test]
+    fn partial_topology_rejects_uncovered_direction_and_overlap_is_ambiguous() {
+        let partial = SpeakerLayout3d::new(
+            vec![
+                speaker3(230, 1.0, 0.0, 0.0),
+                speaker3(231, 0.0, 1.0, 0.0),
+                speaker3(232, 0.0, 0.0, 1.0),
+            ],
+            vec![triplet(230, 231, 232)],
+        )
+        .unwrap();
+        assert!(matches!(
+            partial.gains(CartesianPosition::new(-1.0, 0.0, 0.0)),
+            Err(RenderError::Unsupported3dDirection { .. })
+        ));
+
+        let ambiguous = SpeakerLayout3d::new(
+            vec![
+                speaker3(240, 1.0, 0.0, 0.0),
+                speaker3(241, 0.0, 1.0, 0.0),
+                speaker3(242, 0.0, 0.0, 1.0),
+                speaker3(243, 0.0, 1.0, 1.0),
+            ],
+            vec![triplet(240, 241, 242), triplet(240, 241, 243)],
+        )
+        .unwrap();
+        assert!(matches!(
+            ambiguous.gains(CartesianPosition::new(0.2, 1.0, 0.5)),
+            Err(RenderError::Ambiguous3dCoverage)
+        ));
+    }
+
+    #[test]
+    fn layout_3d_validation_rejects_implicit_or_degenerate_topology() {
+        assert!(matches!(
+            Speaker3d::new(SpeakerId::new(250), CartesianPosition::new(0.0, 0.0, 0.0)),
+            Err(RenderError::Undefined3dSpeakerDirection)
+        ));
+        assert!(matches!(
+            SpeakerLayout3d::new(
+                vec![speaker3(251, 1.0, 0.0, 0.0), speaker3(252, 0.0, 1.0, 0.0)],
+                vec![]
+            ),
+            Err(RenderError::TooFew3dSpeakers { .. })
+        ));
+        assert!(matches!(
+            SpeakerTriplet3d::new(
+                SpeakerId::new(253),
+                SpeakerId::new(253),
+                SpeakerId::new(254)
+            ),
+            Err(RenderError::DuplicateTripletSpeaker)
+        ));
+        let duplicate_direction = SpeakerLayout3d::new(
+            vec![
+                speaker3(255, 1.0, 0.0, 0.0),
+                speaker3(256, 2.0, 0.0, 0.0),
+                speaker3(257, 0.0, 1.0, 0.0),
+            ],
+            vec![triplet(255, 256, 257)],
+        );
+        assert!(matches!(
+            duplicate_direction,
+            Err(RenderError::DuplicateSpeakerDirection { .. })
+        ));
+        let degenerate = SpeakerLayout3d::new(
+            vec![
+                speaker3(258, 1.0, 0.0, 0.0),
+                speaker3(259, 0.0, 1.0, 0.0),
+                speaker3(260, 1.0, 1.0, 0.0),
+            ],
+            vec![triplet(258, 259, 260)],
+        );
+        assert!(matches!(
+            degenerate,
+            Err(RenderError::DegenerateTriplet { .. })
+        ));
+    }
+
+    #[test]
+    fn renderer_3d_is_linear_partition_invariant_and_atomic() {
+        let renderer = LayoutRenderer3d::new(
+            SpeakerLayout3d::new(
+                vec![
+                    speaker3(270, 1.0, 0.0, 0.0),
+                    speaker3(271, 0.0, 1.0, 0.0),
+                    speaker3(272, 0.0, 0.0, 1.0),
+                ],
+                vec![triplet(270, 271, 272)],
+            )
+            .unwrap(),
+        );
+        let samples = [0.25, -0.5, 0.75, -1.0];
+        let full_source = source(273, &samples, 1.0, 2.0, 3.0, 0.5);
+        let whole = render_planes3(&renderer, &[full_source], samples.len());
+        let mut partitioned = vec![vec![0.0; samples.len()]; 3];
+        for (start, end) in [(0, 1), (1, 3), (3, 4)] {
+            let part = source(273, &samples[start..end], 1.0, 2.0, 3.0, 0.5);
+            let mut outputs: Vec<&mut [f64]> = partitioned
+                .iter_mut()
+                .map(|plane| &mut plane[start..end])
+                .collect();
+            renderer.render_block(&[part], &mut outputs).unwrap();
+        }
+        assert_eq!(whole, partitioned);
+
+        let invalid = source(274, &[1.0], -1.0, 0.0, 0.0, 1.0);
+        let mut stale = vec![vec![7.0; 1]; 3];
+        let mut outputs: Vec<&mut [f64]> = stale.iter_mut().map(Vec::as_mut_slice).collect();
+        assert!(matches!(
+            renderer.render_block(&[invalid], &mut outputs),
+            Err(RenderError::Unsupported3dDirection { .. })
+        ));
+        assert_eq!(stale, vec![vec![7.0; 1]; 3]);
+    }
+
+    #[test]
+    fn renderer_3d_has_no_decoder_or_semantic_bridge() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(!manifest.contains("openjoc-scene"));
+        assert!(!manifest.contains("openjoc-joc"));
+        assert!(!manifest.contains("DecodedJocComponents"));
+        assert!(Speaker3d::new(SpeakerId::new(280), CartesianPosition::new(0.0, 0.0, 1.0)).is_ok());
+    }
+    fn render_block_check_fallback(
+        renderer: &mut BinauralRenderer,
+        blocks: &[BinauralSourceBlock<'_>],
+        left: &mut [f64],
+        right: &mut [f64],
+    ) -> Result<(), RenderError> {
+        let mut fallback = renderer.clone();
+        let mut fallback_left = left.to_vec();
+        let mut fallback_right = right.to_vec();
+        let expected =
+            fallback.render_block_impl::<false>(blocks, &mut fallback_left, &mut fallback_right);
+        let actual = renderer.render_block(blocks, left, right);
+        assert_eq!(expected, actual, "forced portable result");
+        assert_f64_slice_bits(&fallback_left, left, "forced portable left");
+        assert_f64_slice_bits(&fallback_right, right, "forced portable right");
+        assert_binaural_state_bits(&fallback, renderer);
+        actual
+    }
+
+    #[test]
+    fn binaural_adjacent_outputs_match_frozen_loop_bits_and_state() {
+        let values = [
+            0.0,
+            -0.0,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            0.1,
+            -0.3,
+            f64::from_bits(0x3ff0_0000_0000_0001),
+            f64::MAX * 0.0001,
+        ];
+        for tap_count in [
+            1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 64, 127, 128, 255, 256, 257, 512,
+        ] {
+            let mut entries = Vec::new();
+            let mut sources = Vec::new();
+            for (index, gain) in [0.7, -0.3, -0.0].into_iter().enumerate() {
+                let direction = CartesianPosition::new(index as f64 * 0.2, 1.0, 0.0);
+                let count = tap_count + index;
+                let taps = (0..count)
+                    .map(|i| 0.001 / (i + 1) as f64)
+                    .collect::<Vec<_>>();
+                let right = taps.iter().map(|x| -x * 0.3).collect::<Vec<_>>();
+                entries.push(hrir_entry_test(index as u64 + 1, direction, &taps, &right));
+                sources.push(
+                    StaticBinauralSource::new(
+                        SourceId::new(index as u64 + 1),
+                        direction,
+                        gain,
+                        HrirEntryId::new(index as u64 + 1),
+                    )
+                    .unwrap(),
+                );
+            }
+            let bank = HrirBank::new(48_000, entries).unwrap();
+            let mut original = BinauralRenderer::new(48_000, bank, sources).unwrap();
+            let mut candidate = original.clone();
+            for (round, length) in [
+                0,
+                1,
+                2,
+                3,
+                4,
+                tap_count - 1,
+                tap_count,
+                tap_count + 1,
+                tap_count + 2,
+                tap_count + 3,
+                tap_count + 4,
+                tap_count + 5,
+                tap_count + 6,
+                tap_count + 7,
+                1537,
+                1,
+                0,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let samples = (0..3)
+                    .map(|source| {
+                        (0..length)
+                            .map(|i| values[(i + source + round) % values.len()])
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let blocks = (0..3)
+                    .rev()
+                    .map(|i| BinauralSourceBlock::new(SourceId::new(i as u64 + 1), &samples[i]))
+                    .collect::<Vec<_>>();
+                let mut expected_left = vec![123.0; length];
+                let mut expected_right = expected_left.clone();
+                let mut actual_left = expected_left.clone();
+                let mut actual_right = expected_left.clone();
+                assert_eq!(
+                    render_block_original_loop(
+                        &mut original,
+                        &blocks,
+                        &mut expected_left,
+                        &mut expected_right
+                    ),
+                    render_block_check_fallback(
+                        &mut candidate,
+                        &blocks,
+                        &mut actual_left,
+                        &mut actual_right
+                    )
+                );
+                assert_f64_slice_bits(&expected_left, &actual_left, "adjacent left");
+                assert_f64_slice_bits(&expected_right, &actual_right, "adjacent right");
+                assert_binaural_state_bits(&original, &candidate);
+            }
+            while original.remaining_tail_samples() > 0 {
+                let n = original.remaining_tail_samples().min(7);
+                let mut expected_left = vec![123.0; n];
+                let mut expected_right = expected_left.clone();
+                let mut actual_left = expected_left.clone();
+                let mut actual_right = expected_left.clone();
+                assert_eq!(
+                    original.drain_tail_block(&mut expected_left, &mut expected_right),
+                    candidate.drain_tail_block(&mut actual_left, &mut actual_right)
+                );
+                assert_f64_slice_bits(&expected_left, &actual_left, "adjacent tail left");
+                assert_f64_slice_bits(&expected_right, &actual_right, "adjacent tail right");
+                assert_binaural_state_bits(&original, &candidate);
+            }
+            original.reset();
+            candidate.reset();
+            assert_binaural_state_bits(&original, &candidate);
+        }
+    }
+
+    #[test]
+    fn binaural_adjacent_outputs_keep_prior_source_accumulators() {
+        let direction = CartesianPosition::new(0.0, 1.0, 0.0);
+        let taps = [1.0, 0.0, -0.0, 0.0, 0.0];
+        let bank =
+            HrirBank::new(48_000, vec![hrir_entry_test(1, direction, &taps, &taps)]).unwrap();
+        let sources = (1..=3)
+            .map(|id| {
+                StaticBinauralSource::new(SourceId::new(id), direction, 1.0, HrirEntryId::new(1))
+                    .unwrap()
+            })
+            .collect();
+        let mut original = BinauralRenderer::new(48_000, bank, sources).unwrap();
+        let mut candidate = original.clone();
+        let samples = [vec![1e16; 39], vec![1.0; 39], vec![-1e16; 39]];
+        let blocks = (0..3)
+            .rev()
+            .map(|i| BinauralSourceBlock::new(SourceId::new(i as u64 + 1), &samples[i]))
+            .collect::<Vec<_>>();
+        let mut expected_left = vec![123.0; 39];
+        let mut expected_right = expected_left.clone();
+        let mut actual_left = expected_left.clone();
+        let mut actual_right = expected_left.clone();
+        assert_eq!(
+            render_block_original_loop(
+                &mut original,
+                &blocks,
+                &mut expected_left,
+                &mut expected_right
+            ),
+            render_block_check_fallback(
+                &mut candidate,
+                &blocks,
+                &mut actual_left,
+                &mut actual_right
+            )
+        );
+        assert_f64_slice_bits(&expected_left, &actual_left, "cancellation left");
+        assert_f64_slice_bits(&expected_right, &actual_right, "cancellation right");
+        assert_binaural_state_bits(&original, &candidate);
+        assert!(expected_left.iter().all(|x| x.to_bits() == 0));
+        // Prior sources must enter the accumulator before each tap addition;
+        // A separately accumulated source subtotal would produce different bits.
+        let second_direction = CartesianPosition::new(0.1, 1.0, 0.0);
+        let second_taps = [1.0, 1.0, 0.0, 0.0, 0.0];
+        let bank = HrirBank::new(
+            48_000,
+            vec![
+                hrir_entry_test(1, direction, &taps, &taps),
+                hrir_entry_test(2, second_direction, &second_taps, &second_taps),
+            ],
+        )
+        .unwrap();
+        let sources = vec![
+            StaticBinauralSource::new(SourceId::new(1), direction, 1.0, HrirEntryId::new(1))
+                .unwrap(),
+            StaticBinauralSource::new(SourceId::new(2), second_direction, 1.0, HrirEntryId::new(2))
+                .unwrap(),
+        ];
+        let mut original = BinauralRenderer::new(48_000, bank, sources).unwrap();
+        let mut candidate = original.clone();
+        let first = vec![1e16; 39];
+        let second = (0..39)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1e16 })
+            .collect::<Vec<_>>();
+        let blocks = [
+            BinauralSourceBlock::new(SourceId::new(2), &second),
+            BinauralSourceBlock::new(SourceId::new(1), &first),
+        ];
+        assert_eq!(
+            render_block_original_loop(
+                &mut original,
+                &blocks,
+                &mut expected_left,
+                &mut expected_right
+            ),
+            render_block_check_fallback(
+                &mut candidate,
+                &blocks,
+                &mut actual_left,
+                &mut actual_right
+            )
+        );
+        assert_f64_slice_bits(&expected_left, &actual_left, "ordered prior-source left");
+        assert_f64_slice_bits(&expected_right, &actual_right, "ordered prior-source right");
+        assert_binaural_state_bits(&original, &candidate);
+        assert_eq!(expected_left[5].to_bits(), 1.0_f64.to_bits());
+    }
+
+    #[test]
+    fn binaural_adjacent_outputs_keep_exception_order_and_atomic_history() {
+        let direction = CartesianPosition::new(0.0, 1.0, 0.0);
+        for exceptional in [
+            f64::from_bits(0x7ff8_0000_0000_0123),
+            f64::from_bits(0xfff8_0000_0000_0456),
+            f64::from_bits(0x7ff0_0000_0000_0001),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+        ] {
+            for lane in 0..4 {
+                for right_first in [false, true] {
+                    let left_taps = [
+                        if right_first { 0.5 } else { 2.0 },
+                        if right_first { 2.0 } else { 0.1 },
+                        -0.1,
+                        0.0,
+                        -0.0,
+                    ];
+                    let right_taps = [2.0, 0.1, -0.1, 0.0, -0.0];
+                    let bank = HrirBank::new(
+                        48_000,
+                        vec![hrir_entry_test(1, direction, &left_taps, &right_taps)],
+                    )
+                    .unwrap();
+                    let sources = (1..=2)
+                        .map(|id| {
+                            StaticBinauralSource::new(
+                                SourceId::new(id),
+                                direction,
+                                1.0,
+                                HrirEntryId::new(1),
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    let mut original = BinauralRenderer::new(48_000, bank, sources).unwrap();
+                    let mut candidate = original.clone();
+                    for round in 0..3 {
+                        let mut samples = [vec![0.1; 17], vec![0.1; 17]];
+                        if round == 1 {
+                            samples[0][8 + lane] = exceptional;
+                            samples[1][4] = exceptional;
+                        }
+                        // Validation follows caller order; arithmetic follows registered source order.
+                        let blocks = [
+                            BinauralSourceBlock::new(SourceId::new(2), &samples[1]),
+                            BinauralSourceBlock::new(SourceId::new(1), &samples[0]),
+                        ];
+                        let mut expected_left = vec![123.0; 17];
+                        let mut expected_right = expected_left.clone();
+                        let mut actual_left = expected_left.clone();
+                        let mut actual_right = expected_left.clone();
+                        let previous_history = original
+                            .sources
+                            .iter()
+                            .map(|source| source.history.clone())
+                            .collect::<Vec<_>>();
+                        let expected = render_block_original_loop(
+                            &mut original,
+                            &blocks,
+                            &mut expected_left,
+                            &mut expected_right,
+                        );
+                        assert_eq!(
+                            expected,
+                            render_block_check_fallback(
+                                &mut candidate,
+                                &blocks,
+                                &mut actual_left,
+                                &mut actual_right
+                            )
+                        );
+                        if round == 1 {
+                            if exceptional.is_finite() {
+                                assert_eq!(
+                                    expected,
+                                    Err(RenderError::NonFiniteOutput {
+                                        channel: if right_first {
+                                            OutputChannel::Right
+                                        } else {
+                                            OutputChannel::Left
+                                        },
+                                        sample_index: 8 + lane
+                                    })
+                                );
+                            } else {
+                                assert_eq!(
+                                    expected,
+                                    Err(RenderError::NonFiniteSourceSample {
+                                        id: SourceId::new(2),
+                                        sample_index: 4
+                                    })
+                                );
+                            }
+                            for (history, source) in previous_history.iter().zip(&candidate.sources)
+                            {
+                                assert_f64_slice_bits(history, &source.history, "failure history");
+                            }
+                        }
+                        assert_f64_slice_bits(&expected_left, &actual_left, "exception left");
+                        assert_f64_slice_bits(&expected_right, &actual_right, "exception right");
+                        assert_binaural_state_bits(&original, &candidate);
+                    }
+                    let mut expected_left = [123.0; 1];
+                    let mut expected_right = expected_left;
+                    let mut actual_left = expected_left;
+                    let mut actual_right = expected_left;
+                    assert_eq!(
+                        original.drain_tail_block(&mut expected_left, &mut expected_right),
+                        candidate.drain_tail_block(&mut actual_left, &mut actual_right)
+                    );
+                    assert_f64_slice_bits(&expected_left, &actual_left, "error tail left");
+                    assert_f64_slice_bits(&expected_right, &actual_right, "error tail right");
+                    original.reset();
+                    candidate.reset();
+                    assert_binaural_state_bits(&original, &candidate);
+                    let samples = [0.1; 17];
+                    let blocks = [
+                        BinauralSourceBlock::new(SourceId::new(1), &samples),
+                        BinauralSourceBlock::new(SourceId::new(2), &samples),
+                    ];
+                    let mut expected_left = [123.0; 17];
+                    let mut expected_right = expected_left;
+                    let mut actual_left = expected_left;
+                    let mut actual_right = expected_left;
+                    assert_eq!(
+                        render_block_original_loop(
+                            &mut original,
+                            &blocks,
+                            &mut expected_left,
+                            &mut expected_right
+                        ),
+                        render_block_check_fallback(
+                            &mut candidate,
+                            &blocks,
+                            &mut actual_left,
+                            &mut actual_right
+                        )
+                    );
+                    assert_f64_slice_bits(&expected_left, &actual_left, "reset left");
+                    assert_f64_slice_bits(&expected_right, &actual_right, "reset right");
+                    assert_binaural_state_bits(&original, &candidate);
+                }
+            }
+        }
+    }
+}

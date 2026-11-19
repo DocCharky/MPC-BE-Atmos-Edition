@@ -1,0 +1,14 @@
+[package]
+name = "openjoc-render"
+version.workspace = true
+description = "Explicit spatial-scene and streaming speaker renderer foundation"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustfft = "6.4.1"
+
+[lints]
+workspace = true

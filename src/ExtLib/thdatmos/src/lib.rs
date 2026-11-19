@@ -1,6 +1,9 @@
 //! thdatmos — real-time TrueHD Atmos decoding (using the `truehd` library from
 //! the truehdd project), exposing through a C API the samples of each element
 //! (bed channel or object) with its position, gain and state.
+//! E-AC-3 (with or without Atmos) is decoded with OpenJOC, see `eac3.rs`.
+
+pub mod eac3;
 
 use std::collections::VecDeque;
 use std::ffi::{CString, c_char};
@@ -128,6 +131,8 @@ pub struct Ctx {
     pending: Vec<Update>,
     queue: VecDeque<Box<ThdFrame>>,
     atmos_seen: bool,
+    eac3: eac3::Eac3Decoder,
+    eac3_seen: bool,
     pub last_error: Option<CString>,
 }
 
@@ -158,6 +163,8 @@ impl Ctx {
             pending: Vec::new(),
             queue: VecDeque::new(),
             atmos_seen: false,
+            eac3: eac3::Eac3Decoder::new(),
+            eac3_seen: false,
             last_error: None,
         }
     }
@@ -176,6 +183,7 @@ impl Ctx {
         self.elements = [ThdElement::default(); MAX_CH];
         self.total = 0;
         self.atmos_seen = false;
+        self.eac3.reset();
     }
 
     /// Pushes raw TrueHD stream bytes.
@@ -186,13 +194,65 @@ impl Ctx {
 
     /// Pushes one IEC 61937 burst (TrueHD packed in a MAT frame, as produced by the
     /// MPC-BE audio decoder). Returns false if the burst is not TrueHD.
+    /// Also accepts E-AC-3 bursts (Dolby Digital Plus, with or without Atmos).
     pub fn push_iec61937(&mut self, burst: &[u8]) -> bool {
         let mut out = Vec::with_capacity(MAT_SIZE);
-        if !self.mat.unpack(burst, &mut out) {
-            return false;
+        if self.mat.unpack(burst, &mut out) {
+            self.push(&out);
+            return true;
         }
-        self.push(&out);
-        true
+        out.clear();
+        if eac3::unpack_iec61937(burst, &mut out) {
+            self.eac3_seen = true;
+            let mut blocks = Vec::new();
+            self.eac3.push(&out, &mut blocks);
+            for b in blocks {
+                self.queue_block(&b);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Stream information: bit 0 TrueHD, bit 1 E-AC-3, bit 2 Atmos objects.
+    pub fn info(&self) -> u32 {
+        let mut i = 0;
+        if self.eac3_seen {
+            i |= 2;
+            if self.eac3.is_atmos() {
+                i |= 4;
+            }
+        } else if self.total > 0 {
+            i |= 1;
+            if self.atmos_seen {
+                i |= 4;
+            }
+        }
+        i
+    }
+
+    /// Splits a decoded E-AC-3 block into frames.
+    fn queue_block(&mut self, b: &eac3::Block) {
+        let ch = b.channels.min(MAX_CH);
+        let mut done = 0;
+        while done < b.samples {
+            let n = (b.samples - done).min(MAX_SAMPLES);
+            let mut f = Box::new(ThdFrame {
+                sample_pos: self.total,
+                samples: n as u32,
+                channels: ch as u32,
+                sample_rate: b.sample_rate,
+                pcm: [[0.0; MAX_CH]; MAX_SAMPLES],
+                elements: b.elements,
+            });
+            for s in 0..n {
+                let row = &b.pcm[(done + s) * b.channels..];
+                f.pcm[s][..ch].copy_from_slice(&row[..ch]);
+            }
+            self.total += n as u64;
+            self.queue.push_back(f);
+            done += n;
+        }
     }
 
     /// Next decoded frame, if any.
@@ -457,11 +517,17 @@ pub unsafe extern "C" fn thd_push(ctx: *mut Ctx, data: *const u8, len: usize) {
     ctx.push(unsafe { std::slice::from_raw_parts(data, len) });
 }
 
-/// IEC 61937 TrueHD burst (MAT frame). Returns 1 if accepted, 0 otherwise.
+/// IEC 61937 burst: TrueHD (MAT frame) or E-AC-3. Returns 1 if accepted, 0 otherwise.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thd_push_iec61937(ctx: *mut Ctx, data: *const u8, len: usize) -> i32 {
     let ctx = unsafe { &mut *ctx };
     ctx.push_iec61937(unsafe { std::slice::from_raw_parts(data, len) }) as i32
+}
+
+/// Stream information: bit 0 TrueHD, bit 1 E-AC-3, bit 2 Atmos objects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thd_info(ctx: *const Ctx) -> u32 {
+    unsafe { &*ctx }.info()
 }
 
 /// Next decoded frame: 1 if `out` was filled, 0 if more data is needed.
