@@ -80,43 +80,8 @@ namespace
 
 	template <class T> void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
-	// Kaiser-windowed sinc interpolation kernel, 48 taps, 2048 phases (~110 dB).
-	constexpr int KERNEL_HALF = 24;
-	constexpr int KERNEL_PHASES = 2048;
-
-	double BesselI0(double x)
-	{
-		double sum = 1.0, term = 1.0;
-		for (int k = 1; k < 50; k++) {
-			term *= (x / (2.0 * k)) * (x / (2.0 * k));
-			sum += term;
-			if (term < 1e-12 * sum) {
-				break;
-			}
-		}
-		return sum;
-	}
-
-	struct Kernel {
-		float taps[KERNEL_PHASES + 1][2 * KERNEL_HALF];
-		Kernel() {
-			const double beta = 10.0, cutoff = 1.0;
-			const double i0b = BesselI0(beta);
-			for (int ph = 0; ph <= KERNEL_PHASES; ph++) {
-				const double frac = (double)ph / KERNEL_PHASES;
-				for (int k = 0; k < 2 * KERNEL_HALF; k++) {
-					// distance between sample k and the fractional position
-					const double t = (double)(k - KERNEL_HALF + 1) - frac;
-					const double x = 3.14159265358979323846 * cutoff * t;
-					const double sinc = (std::fabs(t) < 1e-12) ? 1.0 : std::sin(x) / x;
-					const double r = t / KERNEL_HALF;
-					const double w = (std::fabs(r) >= 1.0) ? 0.0 : BesselI0(beta * std::sqrt(1.0 - r * r)) / i0b;
-					taps[ph][k] = (float)(cutoff * sinc * w);
-				}
-			}
-		}
-	};
-	const Kernel g_kernel;
+	constexpr int KERNEL_HALF = SincKernel::HALF;
+	constexpr int KERNEL_PHASES = SincKernel::PHASES;
 }
 
 void AtmosLog(const wchar_t* fmt, ...)
@@ -237,10 +202,7 @@ HRESULT CAtmosOutput::Open(IMMDevice* pDevice)
 
 	hr = m_pStream->GetService(__uuidof(IAudioClock), (void**)&m_pAudioClock);
 	if (SUCCEEDED(hr)) {
-		m_pAudioClock->GetFrequency(&m_clockFreq);
-		std::lock_guard<std::mutex> lock(m_clockMutex);
-		m_clockSamples.clear();
-		m_audioRate = m_audioRateSeconds = 0.0;
+		m_ClockMeter.Reset();
 	}
 	if (FAILED(hr)) {
 		AtmosLog(L"Open: IAudioClock unavailable (0x%08x)", hr);
@@ -465,14 +427,10 @@ DWORD CAtmosOutput::RenderThread()
 		if (r == WAIT_OBJECT_0 + 1) {
 			RenderPeriod();
 		}
+		m_ClockMeter.Poll(m_pAudioClock);
 		const DWORD now = GetTickCount();
-		if (now - m_dwLastClockSample >= 100) {
-			m_dwLastClockSample = now;
-			SampleAudioClock();
-		}
 		if (now - m_dwLastTick >= 1000) {
 			m_dwLastTick = now;
-			FitAudioClock();
 			if (OnTick) {
 				OnTick();
 			}
@@ -481,61 +439,9 @@ DWORD CAtmosOutput::RenderThread()
 	return 0;
 }
 
-void CAtmosOutput::SampleAudioClock()
-{
-	if (!m_pAudioClock || !m_clockFreq) {
-		return;
-	}
-	UINT64 pos = 0, qpcPos = 0;
-	if (FAILED(m_pAudioClock->GetPosition(&pos, &qpcPos)) || !qpcPos) {
-		return;
-	}
-	const double qpc = qpcPos / 1e7;                // 100 ns units
-	const double audio = (double)pos / (double)m_clockFreq;
-	std::lock_guard<std::mutex> lock(m_clockMutex);
-	if (!m_clockSamples.empty()) {
-		const ClockSample& last = m_clockSamples.back();
-		// A glitch or stream restart breaks the linear relation: start over.
-		if (qpc <= last.qpc || std::fabs((audio - last.audio) - (qpc - last.qpc)) > 0.05) {
-			m_clockSamples.clear();
-		}
-	}
-	m_clockSamples.push_back({ qpc, audio });
-	while (!m_clockSamples.empty() && qpc - m_clockSamples.front().qpc > 120.0) {
-		m_clockSamples.pop_front();
-	}
-}
-
-void CAtmosOutput::FitAudioClock()
-{
-	std::lock_guard<std::mutex> lock(m_clockMutex);
-	if (m_clockSamples.size() < 50) {
-		m_audioRate = m_audioRateSeconds = 0.0;
-		return;
-	}
-	const double x0 = m_clockSamples.front().qpc, y0 = m_clockSamples.front().audio;
-	double sx = 0, sy = 0, sxx = 0, sxy = 0;
-	const double n = (double)m_clockSamples.size();
-	for (const auto& s : m_clockSamples) {
-		const double x = s.qpc - x0, y = s.audio - y0;
-		sx += x; sy += y; sxx += x * x; sxy += x * y;
-	}
-	const double den = n * sxx - sx * sx;
-	if (den > 0) {
-		m_audioRate = (n * sxy - sx * sy) / den;
-		m_audioRateSeconds = m_clockSamples.back().qpc - x0;
-	}
-}
-
 bool CAtmosOutput::GetAudioClockRate(double& rate, double& seconds)
 {
-	std::lock_guard<std::mutex> lock(m_clockMutex);
-	if (m_audioRate <= 0.0) {
-		return false;
-	}
-	rate = m_audioRate;
-	seconds = m_audioRateSeconds;
-	return true;
+	return m_ClockMeter.GetRate(rate, seconds);
 }
 
 bool CAtmosOutput::PullFrame()
@@ -661,8 +567,8 @@ void CAtmosOutput::RenderPeriod()
 				}
 			} else {
 				const float mu = (float)(frac * KERNEL_PHASES - phase);
-				const float* h0 = &g_kernel.taps[phase][0];
-				const float* h1 = &g_kernel.taps[phase + 1][0];
+				const float* h0 = SincKernel::Taps(phase);
+				const float* h1 = SincKernel::Taps(phase + 1);
 				for (unsigned c = 0; c < 16; c++) {
 					if (!out[c]) {
 						continue;

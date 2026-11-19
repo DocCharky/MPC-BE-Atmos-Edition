@@ -31,6 +31,8 @@
 #include "AudioSyncClock.h"
 #include "AtmosOutput.h"
 #include "VSyncMeter.h"
+#include "SyncTools.h"
+#include <atomic>
 #include "DSUtil/Packet.h"
 #include <ExtLib/libbs2b/bs2bclass.h>
 
@@ -90,6 +92,18 @@ class __declspec(uuid("601D2A2B-9CDE-40bd-8650-0485E3522727"))
 	double            m_dVideoFps = 0.0;
 	double            DetectVideoFps();
 	void              UpdateSyncSpeed();
+	double            GetSyncSpeed();
+	void              SetSyncSpeed(double speed);
+	// Display sync on the PCM (WASAPI) path
+	CClockRateMeter   m_ClockMeter;           // WASAPI device clock vs system clock
+	CVarResampler     m_SyncResampler;
+	std::atomic<double> m_dSyncSpeed{1.0};
+	std::atomic<bool> m_bSyncReset{true};
+	REFERENCE_TIME    m_rtSyncAnchor = 0;     // stream time of resampler input sample 0
+	DWORD             m_dwLastSyncTick = 0;
+	std::vector<float> m_SyncIn, m_SyncOut;
+	void              PollSync();
+	double            PcmSyncSpeed() const { return m_bIsBitstream ? 1.0 : m_dSyncSpeed.load(); }
 	HANDLE            m_hAtmosAbort = nullptr;
 	bool    IsTrueHDBitstream(const WAVEFORMATEX* pwfx) const;
 	bool    AtmosSupported();

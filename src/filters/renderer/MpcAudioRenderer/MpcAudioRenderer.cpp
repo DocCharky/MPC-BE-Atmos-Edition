@@ -743,6 +743,7 @@ DWORD CMpcAudioRenderer::RenderThread()
 	bool bExit = false;
 	while (!bExit) {
 		CheckBufferStatus();
+		PollSync();
 
 		DWORD result = -1;
 		if (m_WasapiMethod == WASAPI_METHOD::PUSH) {
@@ -867,6 +868,12 @@ STDMETHODIMP CMpcAudioRenderer::Run(REFERENCE_TIME rtStart)
 			m_pSyncClock->Slave(m_Atmos.GetAudioClock(), m_rtStartTime + m_Atmos.GetCurrentRenderedTime());
 		}
 		return CBaseRenderer::Run(rtStart);
+	}
+
+	m_dVideoFps = DetectVideoFps();
+	AtmosLog(L"Run: PCM playback, film %.3f fps, display sync %s", m_dVideoFps, m_bVideoSync ? L"on" : L"off");
+	if (m_bVideoSync) {
+		m_VSync.Start();
 	}
 
 	{
@@ -1681,6 +1688,45 @@ HRESULT CMpcAudioRenderer::Transform(IMediaSample *pMediaSample)
 		return hr;
 	}
 
+	// Atmos Edition: display sync on the PCM path. The input is converted to float and
+	// resampled by a factor close to 1; the rest of the chain then sees float input.
+	SampleFormat in_sf = m_input_params.sf;
+	int nSyncSamples = -1;
+	if (m_bVideoSync && !m_bIsBitstream && m_dRate == 1.0 && m_input_params.samplerate > 0) {
+		const unsigned ch = m_input_params.channels;
+		const double rate = m_input_params.samplerate;
+		const int n = lSize / m_pWaveFormatExInput->nBlockAlign;
+
+		bool bReset = m_bSyncReset.exchange(false) || m_SyncResampler.Channels() != ch
+			|| S_OK == pMediaSample->IsDiscontinuity();
+		const REFERENCE_TIME rtExpected = m_rtSyncAnchor + (REFERENCE_TIME)((double)m_SyncResampler.InputEnd() * UNITS / rate);
+		if (!bReset && rtStart != INVALID_TIME && std::abs(rtStart - rtExpected) > 20000) {
+			bReset = true; // timestamp jump of more than 2 ms
+		}
+		if (bReset) {
+			m_SyncResampler.Reset(ch);
+			m_rtSyncAnchor = (rtStart != INVALID_TIME) ? rtStart : rtExpected;
+		}
+
+		m_SyncIn.resize((size_t)n * ch);
+		hr = convert_to_float(m_input_params.sf, ch, n, pMediaBuffer, m_SyncIn.data());
+		if (FAILED(hr)) {
+			return hr;
+		}
+		const double speed = m_dSyncSpeed.load();
+		double firstPos = 0.0;
+		const size_t nOut = m_SyncResampler.Process(m_SyncIn.data(), n, speed, m_SyncOut, firstPos);
+		if (!nOut) {
+			return S_OK;
+		}
+		rtStart = m_rtSyncAnchor + (REFERENCE_TIME)(firstPos * UNITS / rate);
+		rtStop  = rtStart + (REFERENCE_TIME)((double)nOut * speed * UNITS / rate);
+		pMediaBuffer = reinterpret_cast<BYTE*>(m_SyncOut.data());
+		lSize = (long)(nOut * ch * sizeof(float));
+		in_sf = SAMPLE_FMT_FLT;
+		nSyncSamples = (int)nOut;
+	}
+
 	auto pInputBufferPointer = pMediaBuffer;
 
 	std::unique_ptr<BYTE[]> pChangedBuffer;
@@ -1690,11 +1736,11 @@ HRESULT CMpcAudioRenderer::Transform(IMediaSample *pMediaSample)
 		m_bUpdateBalanceMask = false;
 	}
 
-	int in_samples = lSize / m_pWaveFormatExInput->nBlockAlign;
+	int in_samples = (nSyncSamples >= 0) ? nSyncSamples : lSize / m_pWaveFormatExInput->nBlockAlign;
 	int out_samples = in_samples;
 	UNREFERENCED_PARAMETER(out_samples);
 
-	const bool bFormatChanged = !m_bIsBitstream && (m_input_params.layout != m_output_params.layout || m_input_params.samplerate != m_output_params.samplerate || m_input_params.sf != m_output_params.sf);
+	const bool bFormatChanged = !m_bIsBitstream && (m_input_params.layout != m_output_params.layout || m_input_params.samplerate != m_output_params.samplerate || in_sf != m_output_params.sf);
 	if (bFormatChanged) {
 		if (m_input_params.layout != m_output_params.layout || m_input_params.samplerate != m_output_params.samplerate) {
 #if defined(DEBUG_OR_LOG) && DBGLOG_LEVEL > 2
@@ -1715,7 +1761,7 @@ HRESULT CMpcAudioRenderer::Transform(IMediaSample *pMediaSample)
 			CAutoLock cResamplerLock(&m_csResampler);
 
 			m_Resampler.SetOptions(1.0, 1.0, false, !!m_bDummyChannels);
-			m_Resampler.UpdateInput(m_input_params.sf, m_input_params.layout, m_input_params.samplerate);
+			m_Resampler.UpdateInput(in_sf, m_input_params.layout, m_input_params.samplerate);
 			m_Resampler.UpdateOutput(m_output_params.sf, m_output_params.layout, m_output_params.samplerate);
 			out_samples = m_Resampler.CalcOutSamples(in_samples);
 			if (out_samples <= 0) {
@@ -1737,7 +1783,7 @@ HRESULT CMpcAudioRenderer::Transform(IMediaSample *pMediaSample)
 			}
 		} else {
 #if defined(DEBUG_OR_LOG) && DBGLOG_LEVEL > 2
-			DLog(L"CMpcAudioRenderer::Transform() - convert: '%s' -> '%s'", GetSampleFormatString(m_input_params.sf), GetSampleFormatString(m_output_params.sf));
+			DLog(L"CMpcAudioRenderer::Transform() - convert: '%s' -> '%s'", GetSampleFormatString(in_sf), GetSampleFormatString(m_output_params.sf));
 #endif
 
 			lSize = out_samples * m_output_params.channels * get_bytes_per_sample(m_output_params.sf);
@@ -1746,18 +1792,18 @@ HRESULT CMpcAudioRenderer::Transform(IMediaSample *pMediaSample)
 			HRESULT hr = E_INVALIDARG;
 			switch (m_output_params.sf) {
 				case SAMPLE_FMT_S16:
-					m_DitherInt16.UpdateInput(m_input_params.sf, m_output_params.channels);
+					m_DitherInt16.UpdateInput(in_sf, m_output_params.channels);
 					m_DitherInt16.Process(reinterpret_cast<int16_t*>(pChangedBuffer.get()), pMediaBuffer, out_samples);
 					hr = S_OK;
 					break;
 				case SAMPLE_FMT_S24:
-					hr = convert_to_int24(m_input_params.sf, m_output_params.channels, out_samples, pMediaBuffer, pChangedBuffer.get());
+					hr = convert_to_int24(in_sf, m_output_params.channels, out_samples, pMediaBuffer, pChangedBuffer.get());
 					break;
 				case SAMPLE_FMT_S32:
-					hr = convert_to_int32(m_input_params.sf, m_output_params.channels, out_samples, pMediaBuffer, reinterpret_cast<int32_t*>(pChangedBuffer.get()));
+					hr = convert_to_int32(in_sf, m_output_params.channels, out_samples, pMediaBuffer, reinterpret_cast<int32_t*>(pChangedBuffer.get()));
 					break;
 				case SAMPLE_FMT_FLT:
-					hr = convert_to_float(m_input_params.sf, m_output_params.channels, out_samples, pMediaBuffer, reinterpret_cast<float*>(pChangedBuffer.get()));
+					hr = convert_to_float(in_sf, m_output_params.channels, out_samples, pMediaBuffer, reinterpret_cast<float*>(pChangedBuffer.get()));
 					break;
 			}
 
@@ -2551,6 +2597,7 @@ HRESULT CMpcAudioRenderer::CreateRenderClient(WAVEFORMATEX *pWaveFormatEx, const
 	EXIT_ON_ERROR(hr);
 
 	hr = m_pAudioClient->GetService(IID_PPV_ARGS(&m_pAudioClock));
+	m_ClockMeter.Reset();
 	if (FAILED(hr)) {
 		DLog(L"CMpcAudioRenderer::CreateRenderClient() - IAudioClient::GetService(IAudioClock) failed: (0x%08x)", hr);
 	}
@@ -3220,7 +3267,8 @@ HRESULT CMpcAudioRenderer::RenderWasapiBuffer()
 					DLog(L"CMpcAudioRenderer::RenderWasapiBuffer() - Discontinuity detected, we are correcting reference clock by %.2f ms", rtTimeDelta / 10000.0f);
 #endif
 				}
-				m_rtNextRenderedSampleTime = m_CurrentPacket->rtStart + SamplesToTime(m_CurrentPacket->size() / m_pWaveFormatExOutput->nBlockAlign, m_pWaveFormatExOutput);
+				// Atmos Edition: with display sync, one output sample covers `speed` input samples.
+				m_rtNextRenderedSampleTime = m_CurrentPacket->rtStart + (REFERENCE_TIME)(SamplesToTime(m_CurrentPacket->size() / m_pWaveFormatExOutput->nBlockAlign, m_pWaveFormatExOutput) * PcmSyncSpeed());
 				m_rtCurrentRenderedTime = m_CurrentPacket->rtStart;
 			}
 
@@ -3234,7 +3282,7 @@ HRESULT CMpcAudioRenderer::RenderWasapiBuffer()
 			nWritenBytes += nFilledBytes;
 			m_nSampleOffset += nFilledBytes;
 
-			m_rtCurrentRenderedTime += SamplesToTime(nFilledBytes / m_pWaveFormatExOutput->nBlockAlign, m_pWaveFormatExOutput);
+			m_rtCurrentRenderedTime += (REFERENCE_TIME)(SamplesToTime(nFilledBytes / m_pWaveFormatExOutput->nBlockAlign, m_pWaveFormatExOutput) * PcmSyncSpeed());
 		} while (nWritenBytes < nAvailableBytes);
 
 		if (!nWritenBytes) {
@@ -3283,6 +3331,7 @@ void CMpcAudioRenderer::WasapiFlush()
 
 	m_rtLastQueuedSampleTimeEnd = 0;
 	m_nSampleOffset = 0;
+	m_bSyncReset = true;
 
 	CAutoLock cResamplerLock(&m_csResampler);
 	m_Resampler.FlushBuffers();
@@ -3565,7 +3614,7 @@ void CMpcAudioRenderer::ApplyVolumeBalance(BYTE* pData, UINT32 size)
 
 void CMpcAudioRenderer::WasapiQueueAdd(std::unique_ptr<CPacket>& p)
 {
-	m_rtLastQueuedSampleTimeEnd = p->rtStart + SamplesToTime(p->size() / m_pWaveFormatExOutput->nBlockAlign, m_pWaveFormatExOutput);
+	m_rtLastQueuedSampleTimeEnd = p->rtStart + (REFERENCE_TIME)(SamplesToTime(p->size() / m_pWaveFormatExOutput->nBlockAlign, m_pWaveFormatExOutput) * PcmSyncSpeed());
 	m_WasapiQueue.Add(p);
 }
 
@@ -3651,6 +3700,7 @@ STDMETHODIMP CMpcAudioRenderer::SetVideoSync(BOOL bValue)
 	m_bVideoSync = bValue;
 	if (!bValue) {
 		m_Atmos.SetSpeed(1.0);
+		m_dSyncSpeed = 1.0;
 		m_pSyncClock->SetSpeed(1.0);
 	}
 	return S_OK;
@@ -3666,23 +3716,23 @@ STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
 {
 	output.Empty();
 	sync.Empty();
-	if (!m_bAtmos) {
-		return S_FALSE;
+	if (m_bAtmos) {
+		output.Format(L"Windows Spatial Sound, TrueHD → objects (%u dynamic max)", m_Atmos.GetDynamicObjectCount());
 	}
-	output.Format(L"Windows Spatial Sound, TrueHD \u2192 objects (%u dynamic max)", m_Atmos.GetDynamicObjectCount());
 
 	double hz = 0.0, secs = 0.0, audioRate = 0.0, audioSecs = 0.0;
 	const bool bMeasured = m_VSync.GetRefreshRate(hz, secs);
-	const bool bAudio = m_Atmos.GetAudioClockRate(audioRate, audioSecs);
-	const double speed = m_Atmos.GetSpeed();
+	const bool bAudio = m_bAtmos ? m_Atmos.GetAudioClockRate(audioRate, audioSecs) : m_ClockMeter.GetRate(audioRate, audioSecs);
 	if (!m_bVideoSync) {
 		sync = L"Display sync off";
+	} else if (!m_bAtmos && m_bIsBitstream) {
+		sync = L"Display sync: not possible with bitstream";
 	} else if (m_dVideoFps <= 0.0) {
 		sync = L"Display sync: no video detected";
 	} else if (!bMeasured || !bAudio) {
 		sync.Format(L"%.3f fps, measuring...", m_dVideoFps);
 	} else {
-		sync.Format(L"%.3f fps | %.5f Hz | audio %+.1f ppm | x%.7f", m_dVideoFps, hz, (audioRate - 1.0) * 1e6, speed);
+		sync.Format(L"%.3f fps | %.5f Hz | audio %+.1f ppm | x%.7f", m_dVideoFps, hz, (audioRate - 1.0) * 1e6, GetSyncSpeed());
 	}
 	return S_OK;
 }
@@ -3728,16 +3778,52 @@ double CMpcAudioRenderer::DetectVideoFps()
 	return fps;
 }
 
+double CMpcAudioRenderer::GetSyncSpeed()
+{
+	return m_bAtmos ? m_Atmos.GetSpeed() : m_dSyncSpeed.load();
+}
+
+void CMpcAudioRenderer::SetSyncSpeed(double speed)
+{
+	if (m_bAtmos) {
+		m_Atmos.SetSpeed(speed);
+	} else {
+		m_dSyncSpeed = speed;
+	}
+	m_pSyncClock->SetSpeed(speed);
+}
+
+// Render thread, PCM path: measures the WASAPI clock and updates the speed every second.
+// The audio client is only released while this thread is paused.
+void CMpcAudioRenderer::PollSync()
+{
+	if (m_bAtmos) {
+		return; // the Atmos output measures its own clock
+	}
+	m_ClockMeter.Poll(m_pAudioClock);
+	const DWORD now = GetTickCount();
+	if (now - m_dwLastSyncTick >= 1000) {
+		m_dwLastSyncTick = now;
+		UpdateSyncSpeed();
+	}
+}
+
 void CMpcAudioRenderer::UpdateSyncSpeed()
 {
 	// ReClock-style sync: speed = real refresh / (k x film frame rate).
 	// The graph clock follows the audio device clock, so the display refresh must be
 	// expressed in audio-clock time: refresh(audio) = refresh(QPC) / audioRate.
-	double target = 1.0;
 	double hz = 0.0, secs = 0.0, audioRate = 0.0, audioSecs = 0.0;
 	const bool bHz = m_VSync.GetRefreshRate(hz, secs);
-	const bool bAudio = m_Atmos.GetAudioClockRate(audioRate, audioSecs);
-	if (m_bVideoSync && m_dVideoFps > 0.0 && bHz && secs >= 15.0 && bAudio && audioSecs >= 15.0) {
+	const bool bAudio = m_bAtmos ? m_Atmos.GetAudioClockRate(audioRate, audioSecs) : m_ClockMeter.GetRate(audioRate, audioSecs);
+	const bool bEnabled = m_bVideoSync && m_dVideoFps > 0.0
+		&& (m_bAtmos || (!m_bIsBitstream && m_dRate == 1.0 && m_pRenderClient));
+	const double current = GetSyncSpeed();
+
+	// While measuring (start, after a pause), keep the current speed.
+	double target = bEnabled ? current : 1.0;
+	if (bEnabled && bHz && secs >= 15.0 && bAudio && audioSecs >= 15.0) {
+		target = 1.0;
 		const double hzAudio = hz / audioRate;
 		const double k = std::floor(hzAudio / m_dVideoFps + 0.5);
 		if (k >= 1.0 && k <= 8.0) {
@@ -3747,19 +3833,17 @@ void CMpcAudioRenderer::UpdateSyncSpeed()
 			}
 		}
 	}
-	const double current = m_Atmos.GetSpeed();
 	double next = current + (target - current) * 0.25;
-	if (std::abs(next - target) < 1e-7) {
+	if (!bEnabled || std::abs(next - target) < 1e-7) {
 		next = target;
 	}
 	if (next != current) {
-		m_Atmos.SetSpeed(next);
-		m_pSyncClock->SetSpeed(next);
+		SetSyncSpeed(next);
 	}
 	static unsigned s_tick = 0;
-	if (++s_tick % 30 == 0) {
-		AtmosLog(L"Sync: film %.3f fps, display %.5f Hz (%.0f s), audio clock %+.1f ppm (%.0f s), speed x%.7f",
-				 m_dVideoFps, hz, secs, bAudio ? (audioRate - 1.0) * 1e6 : 0.0, audioSecs, next);
+	if (bEnabled && ++s_tick % 30 == 0) {
+		AtmosLog(L"Sync (%s): film %.3f fps, display %.5f Hz (%.0f s), audio clock %+.1f ppm (%.0f s), speed x%.7f",
+				 m_bAtmos ? L"Atmos" : L"PCM", m_dVideoFps, hz, secs, bAudio ? (audioRate - 1.0) * 1e6 : 0.0, audioSecs, next);
 	}
 }
 

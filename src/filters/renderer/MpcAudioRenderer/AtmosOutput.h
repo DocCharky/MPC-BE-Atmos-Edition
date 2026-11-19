@@ -28,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include "SyncTools.h"
 
 // Diagnostic log: atmos.log, next to the module (.ax).
 void AtmosLog(const wchar_t* fmt, ...);
@@ -138,16 +139,8 @@ private:
 	double         m_dSpeed = 1.0;
 	DWORD          m_dwLastTick = 0;
 
-	// Audio clock vs system clock measurement (sliding window regression)
-	struct ClockSample { double qpc; double audio; };
-	std::deque<ClockSample> m_clockSamples;
-	std::mutex     m_clockMutex;
-	UINT64         m_clockFreq = 0;
-	DWORD          m_dwLastClockSample = 0;
-	double         m_audioRate = 0.0;
-	double         m_audioRateSeconds = 0.0;
-	void           SampleAudioClock();
-	void           FitAudioClock();
+	// Audio clock vs system clock measurement
+	CClockRateMeter m_ClockMeter;
 
 	static constexpr REFERENCE_TIME INVALID_TIME_VALUE = INT64_MIN;
 };

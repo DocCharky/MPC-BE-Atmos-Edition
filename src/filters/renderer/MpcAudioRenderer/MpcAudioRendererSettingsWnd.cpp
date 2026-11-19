@@ -349,7 +349,7 @@ void CMpcAudioRendererStatusWnd::UpdateStatus()
 		}
 
 		CString atmosOut, atmosSync;
-		if (m_pMAR->GetAtmosStatus(atmosOut, atmosSync) == S_OK) {
+		if (m_pMAR->GetAtmosStatus(atmosOut, atmosSync) == S_OK && !atmosOut.IsEmpty()) {
 			modeStr = atmosOut;
 		}
 		m_edtMode.SetWindowTextW(modeStr);
