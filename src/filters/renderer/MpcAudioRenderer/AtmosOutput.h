@@ -37,6 +37,8 @@
 
 // Diagnostic log: SpatialClock.log, next to the module (.ax).
 void AtmosLog(const wchar_t* fmt, ...);
+// Diagnostic log on/off (renderer option, off by default).
+void AtmosLogEnable(bool bEnable);
 
 class CAtmosOutput
 {

@@ -52,6 +52,7 @@ private :
 	CButton		m_cbVideoSync;
 	CButton		m_cbHeightObjects;
 	CButton		m_cbEac3Objects;
+	CButton		m_cbDiagnosticLog;
 	CButton		m_btnReset;
 
 	CStatic		m_txtSoundDevice;
@@ -73,6 +74,7 @@ private :
 		IDC_PP_VIDEO_SYNC,
 		IDC_PP_HEIGHT_OBJECTS,
 		IDC_PP_EAC3_OBJECTS,
+		IDC_PP_DIAGNOSTIC_LOG,
 		IDC_PP_RESET,
 	};
 
@@ -86,7 +88,7 @@ public:
 	bool OnApply();
 
 	static LPCWSTR GetWindowTitle() { return MAKEINTRESOURCEW(IDS_FILTER_SETTINGS_CAPTION); }
-	static CSize GetWindowSize() { return CSize(340, 359); }
+	static CSize GetWindowSize() { return CSize(340, 379); }
 
 	DECLARE_MESSAGE_MAP()
 

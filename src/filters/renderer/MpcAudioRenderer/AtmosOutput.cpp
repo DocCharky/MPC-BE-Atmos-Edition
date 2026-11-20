@@ -87,8 +87,18 @@ namespace
 	constexpr int KERNEL_PHASES = SincKernel::PHASES;
 }
 
+static std::atomic<bool> s_logEnabled{false};
+
+void AtmosLogEnable(bool bEnable)
+{
+	s_logEnabled = bEnable;
+}
+
 void AtmosLog(const wchar_t* fmt, ...)
 {
+	if (!s_logEnabled) {
+		return; // option off: nothing is written
+	}
 	static std::mutex s_logMutex;
 	static wchar_t s_path[MAX_PATH] = {};
 	std::lock_guard<std::mutex> lock(s_logMutex);

@@ -52,6 +52,7 @@
 #define OPT_VideoSync               L"VideoSync"
 #define OPT_HeightObjects           L"HeightObjects"
 #define OPT_Eac3Objects             L"Eac3Objects"
+#define OPT_DiagnosticLog           L"DiagnosticLog"
 // TODO: rename option values
 
 // set to 1(or more) to enable more detail debug log
@@ -284,6 +285,9 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_Eac3Objects, dw)) {
 			m_bEac3Objects = !!dw;
 		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DiagnosticLog, dw)) {
+			m_bDiagnosticLog = !!dw;
+		}
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -303,6 +307,7 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_VideoSync, m_bVideoSync);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_HeightObjects, m_bHeightObjects);
 	profile.ReadInt(OPT_SECTION_AudRend, OPT_Eac3Objects, m_bEac3Objects);
+	profile.ReadInt(OPT_SECTION_AudRend, OPT_DiagnosticLog, m_bDiagnosticLog);
 #endif
 
 	if (m_DeviceMode != MODE_WASAPI_EXCLUSIVE) {
@@ -369,6 +374,7 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	m_pSyncClock = DNew CAudioSyncClock(GetOwner(), &hr);
 
 	m_hAtmosAbort = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	AtmosLogEnable(!!m_bDiagnosticLog);
 	AtmosLog(L"MPC SpatialClock loaded");
 	m_Atmos.OnClockOffset = [this](REFERENCE_TIME delta) {
 		if (m_pSyncClock) {
@@ -1282,6 +1288,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 		key.SetDWORDValue(OPT_VideoSync, m_bVideoSync);
 		key.SetDWORDValue(OPT_HeightObjects, m_bHeightObjects);
 		key.SetDWORDValue(OPT_Eac3Objects, m_bEac3Objects);
+		key.SetDWORDValue(OPT_DiagnosticLog, m_bDiagnosticLog);
 	}
 #else
 	CProfile& profile = AfxGetProfile();
@@ -1301,6 +1308,7 @@ STDMETHODIMP CMpcAudioRenderer::Apply()
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_VideoSync, m_bVideoSync);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_HeightObjects, m_bHeightObjects);
 	profile.WriteInt(OPT_SECTION_AudRend, OPT_Eac3Objects, m_bEac3Objects);
+	profile.WriteInt(OPT_SECTION_AudRend, OPT_DiagnosticLog, m_bDiagnosticLog);
 #endif
 
 	return S_OK;
@@ -4017,6 +4025,20 @@ HRESULT CMpcAudioRenderer::TransformSpatialPcm(IMediaSample* pMediaSample)
 	m_rtLastReceivedSampleTimeEnd = (rtStart == INVALID_TIME ? m_rtLastReceivedSampleTimeEnd : rtStart)
 								  + llMulDiv(samples, UNITS, pwf->nSamplesPerSec, 0);
 	return hr;
+}
+
+STDMETHODIMP CMpcAudioRenderer::SetDiagnosticLog(BOOL bValue)
+{
+	CAutoLock cAutoLock(&m_csProps);
+	m_bDiagnosticLog = bValue;
+	AtmosLogEnable(!!bValue);
+	return S_OK;
+}
+
+STDMETHODIMP_(BOOL) CMpcAudioRenderer::GetDiagnosticLog()
+{
+	CAutoLock cAutoLock(&m_csProps);
+	return m_bDiagnosticLog;
 }
 
 STDMETHODIMP CMpcAudioRenderer::SetEac3Objects(BOOL bValue)

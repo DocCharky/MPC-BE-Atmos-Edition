@@ -107,6 +107,8 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 	p.y += h20 + m_fontheight;
 	m_cbVideoSync.Create(L"Sync audio to display refresh (ReClock-style, resamples)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_VIDEO_SYNC);
 	p.y += h20;
+	m_cbDiagnosticLog.Create(L"Write diagnostic log (SpatialClock.log, next to the .ax)", dwStyle | BS_AUTOCHECKBOX | BS_LEFTTEXT, CRect(p, CSize(ScaleX(320), m_fontheight)), this, IDC_PP_DIAGNOSTIC_LOG);
+	p.y += h20;
 	p.x += ScaleX(240);
 	m_btnReset.Create(ResStr(IDS_FILTER_RESET_SETTINGS), dwStyle | BS_MULTILINE, CRect(p, CSize(ScaleX(80), ScaleX(32))), this, IDC_PP_RESET);
 
@@ -154,6 +156,7 @@ bool CMpcAudioRendererSettingsWnd::OnActivate()
 		m_cbVideoSync.SetCheck(m_pMAR->GetVideoSync());
 		m_cbHeightObjects.SetCheck(m_pMAR->GetHeightObjects());
 		m_cbEac3Objects.SetCheck(m_pMAR->GetEac3Objects());
+		m_cbDiagnosticLog.SetCheck(m_pMAR->GetDiagnosticLog());
 	}
 
 	for (CWnd* pWnd = GetWindow(GW_CHILD); pWnd; pWnd = pWnd->GetNextWindow()) {
@@ -198,6 +201,7 @@ bool CMpcAudioRendererSettingsWnd::OnApply()
 		m_pMAR->SetVideoSync(m_cbVideoSync.GetCheck());
 		m_pMAR->SetHeightObjects(m_cbHeightObjects.GetCheck());
 		m_pMAR->SetEac3Objects(m_cbEac3Objects.GetCheck());
+		m_pMAR->SetDiagnosticLog(m_cbDiagnosticLog.GetCheck());
 		int idx = m_cbSoundDevice.GetCurSel();
 		if (idx >= 0) {
 			m_pMAR->SetDeviceId(m_deviceList[idx].deviceId, m_deviceList[idx].deviceName);
@@ -258,6 +262,7 @@ void CMpcAudioRendererSettingsWnd::OnBnClickedReset()
 	m_cbVideoSync.SetCheck(BST_CHECKED);
 	m_cbHeightObjects.SetCheck(BST_CHECKED);
 	m_cbEac3Objects.SetCheck(BST_CHECKED);
+	m_cbDiagnosticLog.SetCheck(BST_UNCHECKED);
 
 	OnClickedWasapiMode();
 
