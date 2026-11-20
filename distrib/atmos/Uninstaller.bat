@@ -6,6 +6,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-regsvr32 /s /u "%~dp0MpcAudioRendererAtmos.ax"
-echo MPC Audio Renderer Atmos is uninstalled.
+regsvr32 /s /u "%~dp0MpcSpatialClock.ax"
+echo MPC SpatialClock is uninstalled.
 pause

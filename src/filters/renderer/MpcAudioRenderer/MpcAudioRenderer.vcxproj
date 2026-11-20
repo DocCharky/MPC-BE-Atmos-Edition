@@ -19,7 +19,7 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)'=='Debug Filter' Or '$(Configuration)'=='Release Filter'">
     <TargetExt>.ax</TargetExt>
-    <TargetName>MpcAudioRendererAtmos</TargetName>
+    <TargetName>MpcSpatialClock</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug Filter|Win32'">
     <ClCompile>

@@ -98,7 +98,7 @@ void AtmosLog(const wchar_t* fmt, ...)
 						   (LPCWSTR)&s_moduleAnchor, &hSelf);
 		GetModuleFileNameW(hSelf, s_path, MAX_PATH);
 		if (wchar_t* p = wcsrchr(s_path, L'\\')) {
-			wcscpy_s(p + 1, MAX_PATH - (p + 1 - s_path), L"atmos.log");
+			wcscpy_s(p + 1, MAX_PATH - (p + 1 - s_path), L"SpatialClock.log");
 		}
 	}
 	FILE* f = nullptr;

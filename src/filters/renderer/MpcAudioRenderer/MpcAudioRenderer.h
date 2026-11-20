@@ -38,7 +38,7 @@
 
 #include <optional>
 
-#define MpcAudioRendererName L"MPC Audio Renderer Atmos"
+#define MpcAudioRendererName L"MPC SpatialClock"
 
 // if you get a compilation error on AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED,
 // uncomment the #define below

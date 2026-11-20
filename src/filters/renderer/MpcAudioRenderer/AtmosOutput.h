@@ -35,7 +35,7 @@
 #include <vector>
 #include "SyncTools.h"
 
-// Diagnostic log: atmos.log, next to the module (.ax).
+// Diagnostic log: SpatialClock.log, next to the module (.ax).
 void AtmosLog(const wchar_t* fmt, ...);
 
 class CAtmosOutput

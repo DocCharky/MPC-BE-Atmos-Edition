@@ -34,8 +34,8 @@
 #include "filters/transform/MpaDecFilter/MpaDecFilter.h"
 
 // option names
-#define OPT_REGKEY_AudRend          L"Software\\MPC-BE Filters\\MPC Audio Renderer Atmos"
-#define OPT_SECTION_AudRend         L"Filters\\MPC Audio Renderer Atmos"
+#define OPT_REGKEY_AudRend          L"Software\\MPC-BE Filters\\MPC SpatialClock"
+#define OPT_SECTION_AudRend         L"Filters\\MPC SpatialClock"
 #define OPT_DeviceMode              L"DeviceMode"
 #define OPT_WasapiMethod            L"WasapiMethod"
 #define OPT_BufferDuration          L"BufferDuration"
@@ -369,7 +369,7 @@ CMpcAudioRenderer::CMpcAudioRenderer(LPUNKNOWN punk, HRESULT *phr)
 	m_pSyncClock = DNew CAudioSyncClock(GetOwner(), &hr);
 
 	m_hAtmosAbort = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-	AtmosLog(L"MPC Audio Renderer Atmos loaded");
+	AtmosLog(L"MPC SpatialClock loaded");
 	m_Atmos.OnClockOffset = [this](REFERENCE_TIME delta) {
 		if (m_pSyncClock) {
 			m_pSyncClock->OffsetAudioClock(delta);
