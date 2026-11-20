@@ -894,12 +894,13 @@ impl OpenJocSession {
     }
 }
 
-/// Atmos Edition: default home-theatre reference screen (whole front wall, listener level).
+/// Atmos Edition: neutral reference screen. With this geometry the screen-relative
+/// interpolation leaves coded positions unchanged (x = coded x, z = coded z).
 pub(crate) fn default_reference_screen() -> openjoc_oamd::ReferenceScreen {
     openjoc_oamd::ReferenceScreen {
-        bottom_left: openjoc_oamd::Position3 { x: 0.0, y: 0.0, z: 0.0 },
+        bottom_left: openjoc_oamd::Position3 { x: 0.0, y: 0.0, z: -1.0 },
         width: 1.0,
-        height: 0.0,
+        height: 2.0,
     }
 }
 

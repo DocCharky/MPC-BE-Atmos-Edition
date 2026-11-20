@@ -18,7 +18,10 @@ impl SpeakerRenderer {
             assembler: BridgeControlAssembler::new_with_base_projection(
                 64,
                 dimensions,
-                !layout.is_stereo(),
+                // Atmos Edition: the JOC objects already carry the whole scene (the
+                // base is their downmix); projecting the base as well rendered every
+                // bed signal twice (+6 dB against the height objects).
+                false,
             ),
             frame_bridge: JocSpatialFrameBridge,
             bridge: JocSpatialBridge::new(),
