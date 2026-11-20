@@ -3762,7 +3762,7 @@ STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
 		const uint32_t info = m_Atmos.GetStreamInfo();
 		const bool bAtmosStream = !!(info & 4);
 		if (m_BitstreamMode == BITSTREAM_EAC3) {
-			output = bAtmosStream ? L"Windows Spatial Sound, E-AC-3 Atmos \u2192 9.1.6 fixed objects"
+			output = bAtmosStream ? L"Windows Spatial Sound, E-AC-3 Atmos \u2192 objects"
 								  : L"Windows Spatial Sound, E-AC-3 \u2192 fixed objects";
 		} else if (info && !bAtmosStream) {
 			output = L"Windows Spatial Sound, TrueHD \u2192 fixed objects";

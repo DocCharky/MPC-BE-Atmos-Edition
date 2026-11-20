@@ -6,7 +6,7 @@
  * through Windows Spatial Sound ("Dolby Atmos for home theater"): each element
  * of the track becomes a positioned audio object. TrueHD decoding is done by
  * thdatmos.dll (based on truehdd, Apache 2.0 license); E-AC-3 decoding uses
- * OpenJOC (Apache 2.0), which renders the Atmos scene to 9.1.6 fixed objects.
+ * OpenJOC (Apache 2.0), which reconstructs the Atmos objects.
  * Also plays PCM with height channels (DTS:X decoded by MPC-BE, 7.1.4 files):
  * each channel becomes an object fixed at its speaker position.
  *
