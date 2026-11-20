@@ -262,6 +262,9 @@ pub struct OpenJocConfig {
     pub validation_profile: ValidationProfile,
     pub oamd: OamdDecoderConfig,
     pub binaural: Option<BinauralConfig>,
+    /// Atmos Edition: output the objects (signals and positions) instead of a
+    /// speaker render. Speaker mode only.
+    pub object_output: bool,
 }
 
 impl Default for OpenJocConfig {
@@ -276,6 +279,7 @@ impl Default for OpenJocConfig {
             validation_profile: ValidationProfile::Auto,
             oamd: OamdDecoderConfig::default(),
             binaural: None,
+            object_output: false,
         }
     }
 }
@@ -698,6 +702,30 @@ pub struct OpenJocPcmFrame {
     pub sample_count: usize,
     pub pts_samples: Option<i64>,
     pub interleaved_f32: Vec<f32>,
+    /// Atmos Edition: with `OpenJocConfig::object_output`, one track per channel
+    /// of `interleaved_f32` (the last one is the LFE).
+    pub object_tracks: Option<Vec<OpenJocObjectTrack>>,
+}
+
+/// Atmos Edition: state of one object from `sample_offset` in its frame.
+/// `coordinates` are room coordinates (x left->right, y front->back, z floor->
+/// ceiling, each 0..1) for positioned objects; empty for channel-bound objects,
+/// which are identified by `identity` ("FL", "Ls", "TFL"...).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenJocObjectState {
+    pub sample_offset: usize,
+    pub coordinates: Vec<f64>,
+    pub identity: String,
+    pub gain: f64,
+    pub active: bool,
+}
+
+/// Atmos Edition: one output track of an object frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OpenJocObjectTrack {
+    pub lfe: bool,
+    /// Changes within the frame, in order; the first one starts at offset 0.
+    pub states: Vec<OpenJocObjectState>,
 }
 
 /// Non-error result of a push/drain operation.
@@ -1119,6 +1147,11 @@ struct SpeakerRenderer {
     common_profile_stereo_enabled: bool,
     #[cfg(not(target_arch = "wasm32"))]
     render_timing: render_timing::SpeakerTimingState,
+    // Atmos Edition: object output
+    object_output: bool,
+    object_state: Option<Vec<openjoc_scene::SpatialBindingRecord>>,
+    object_ordinals: Option<Vec<usize>>,
+    object_tracks: VecDeque<Vec<OpenJocObjectTrack>>,
 }
 
 fn base_coordinate(location: ChannelLocation) -> Result<BaseFullBandCoordinate, OpenJocError> {

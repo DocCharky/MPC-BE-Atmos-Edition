@@ -280,6 +280,7 @@ fn failed_orientation_reset_clears_queued_pcm_and_fails_closed() {
         layout_name: "Binaural stereo".to_owned(),
         render_mode: RenderMode::Binaural,
         sample_count: 1,
+        object_tracks: None,
         pts_samples: Some(0),
         interleaved_f32: vec![0.0, 0.0],
     });

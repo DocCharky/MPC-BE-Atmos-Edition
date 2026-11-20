@@ -1,8 +1,8 @@
 //! E-AC-3 (Dolby Digital Plus) decoding with OpenJOC.
 //!
-//! - E-AC-3 with Atmos (JOC): the object scene is rendered by OpenJOC to a 9.1.6
-//!   speaker layout; each of the 16 channels then becomes an object fixed at its
-//!   speaker position, and the AVR renders them to the real speakers.
+//! - E-AC-3 with Atmos (JOC): OpenJOC reconstructs the objects; each one is passed
+//!   on as an object with its own moving position (no intermediate speaker render),
+//!   and the AVR renders them to the real speakers, as with a native Atmos stream.
 //! - E-AC-3 without Atmos: decoded by the OpenJOC E-AC-3 core decoder; each channel
 //!   becomes a fixed object, like a non-Atmos TrueHD track.
 
@@ -14,16 +14,19 @@ use openjoc_eac3::{
 };
 
 const IEC61937_EAC3: u16 = 0x15;
+// Object output needs a layout with 3 coordinate dimensions (heights).
 const RENDER_LAYOUT: &str = "9.1.6";
 const MAX_BUFFER: usize = 1 << 20; // resync if this much data never forms an access unit
 
 /// One block of decoded audio: interleaved PCM and the element of each channel.
+/// `changes` holds later element updates within the block (sample offset, elements).
 pub struct Block {
     pub pcm: Vec<f32>,
     pub channels: usize,
     pub samples: usize,
     pub sample_rate: u32,
     pub elements: [ThdElement; MAX_CH],
+    pub changes: Vec<(usize, [ThdElement; MAX_CH])>,
 }
 
 /// Extracts the E-AC-3 payload of one IEC 61937 burst (16-bit words, byte-swapped).
@@ -180,6 +183,7 @@ impl Eac3Decoder {
             if self.session.is_none() {
                 let config = OpenJocConfig {
                     speaker_layout: RENDER_LAYOUT.to_owned(),
+                    object_output: true,
                     ..OpenJocConfig::default()
                 };
                 self.session = OpenJocSession::new(config).ok();
@@ -198,8 +202,31 @@ impl Eac3Decoder {
                         while let Some(f) = session.receive_frame() {
                             let channels = f.channel_count.min(MAX_CH);
                             let mut elements = [ThdElement::default(); MAX_CH];
-                            for (c, label) in f.channel_labels.iter().take(channels).enumerate() {
-                                elements[c] = label_element(label);
+                            let mut changes = Vec::new();
+                            if let Some(tracks) = &f.object_tracks {
+                                // Element state at each update offset within the frame.
+                                let mut offsets: Vec<usize> = tracks
+                                    .iter()
+                                    .flat_map(|t| t.states.iter().map(|st| st.sample_offset))
+                                    .collect();
+                                offsets.push(0);
+                                offsets.sort_unstable();
+                                offsets.dedup();
+                                for &offset in &offsets {
+                                    let mut at = [ThdElement::default(); MAX_CH];
+                                    for (c, track) in tracks.iter().take(channels).enumerate() {
+                                        at[c] = track_element(track, offset);
+                                    }
+                                    if offset == 0 {
+                                        elements = at;
+                                    } else {
+                                        changes.push((offset, at));
+                                    }
+                                }
+                            } else {
+                                for (c, label) in f.channel_labels.iter().take(channels).enumerate() {
+                                    elements[c] = label_element(label);
+                                }
                             }
                             let pcm = if channels == f.channel_count {
                                 f.interleaved_f32
@@ -215,6 +242,7 @@ impl Eac3Decoder {
                                 samples: f.sample_count,
                                 sample_rate: f.sample_rate,
                                 elements,
+                                changes,
                             });
                         }
                         return;
@@ -268,9 +296,38 @@ impl Eac3Decoder {
                 samples: n,
                 sample_rate: pcm.sample_rate,
                 elements,
+                changes: Vec::new(),
             });
         }
     }
+}
+
+/// Element of an OpenJOC object track at a sample offset of its frame.
+fn track_element(track: &openjoc_api::OpenJocObjectTrack, offset: usize) -> ThdElement {
+    if track.lfe {
+        return ThdElement { kind: KIND_LFE, active: 1, gain: 1.0, ..Default::default() };
+    }
+    let Some(state) = track.states.iter().rev().find(|st| st.sample_offset <= offset).or(track.states.first())
+    else {
+        return ThdElement::default();
+    };
+    let mut e = if state.coordinates.len() >= 3 {
+        // OpenJOC room coordinates (x left->right, y front->back, z floor->ceiling, 0..1)
+        // to DAMF (x left/right -1..1, y back/front -1..1, z floor/ceiling 0..1).
+        let c = &state.coordinates;
+        object(
+            (2.0 * c[0] - 1.0).clamp(-1.0, 1.0) as f32,
+            (1.0 - 2.0 * c[1]).clamp(-1.0, 1.0) as f32,
+            c[2].clamp(0.0, 1.0) as f32,
+        )
+    } else {
+        label_element(&state.identity)
+    };
+    if e.kind == KIND_OBJECT {
+        e.gain = state.gain.max(0.0) as f32;
+        e.active = u32::from(state.active && e.active != 0);
+    }
+    e
 }
 
 fn object(x: f32, y: f32, z: f32) -> ThdElement {

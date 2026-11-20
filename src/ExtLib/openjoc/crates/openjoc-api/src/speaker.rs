@@ -18,10 +18,7 @@ impl SpeakerRenderer {
             assembler: BridgeControlAssembler::new_with_base_projection(
                 64,
                 dimensions,
-                // Atmos Edition: the JOC objects already carry the whole scene (the
-                // base is their downmix); projecting the base as well rendered every
-                // bed signal twice (+6 dB against the height objects).
-                false,
+                !layout.is_stereo(),
             ),
             frame_bridge: JocSpatialFrameBridge,
             bridge: JocSpatialBridge::new(),
@@ -39,7 +36,25 @@ impl SpeakerRenderer {
             common_profile_stereo_enabled,
             #[cfg(not(target_arch = "wasm32"))]
             render_timing: super::render_timing::SpeakerTimingState::default(),
+            object_output: false,
+            object_state: None,
+            object_ordinals: None,
+            object_tracks: VecDeque::new(),
         }
+    }
+
+    /// Atmos Edition: output the scene's objects (signals + positions) instead of
+    /// a speaker render. Requires a speaker layout with 3 coordinate dimensions.
+    pub(super) fn set_object_output(&mut self, enabled: bool) {
+        self.object_output = enabled;
+    }
+
+    pub(super) fn object_output(&self) -> bool {
+        self.object_output
+    }
+
+    pub(super) fn take_object_tracks(&mut self) -> Option<Vec<super::OpenJocObjectTrack>> {
+        self.object_tracks.pop_front()
     }
 
     pub(super) fn layout_info(&self) -> SemanticChannelLayout {
@@ -153,10 +168,13 @@ impl SpeakerRenderer {
                 self.expected_sample, frame.sample_range.start_sample
             )));
         }
+        // Atmos Edition: owned copy (a few entries), so that `self` can be borrowed
+        // mutably by the object output below.
         let base_coordinates = self
             .base_coordinates
-            .as_ref()
+            .clone()
             .ok_or_else(|| OpenJocError::Render("missing Base coordinate topology".to_owned()))?;
+        let base_coordinates = base_coordinates.as_slice();
         if base.sample_rate != frame.sample_rate {
             return Err(OpenJocError::FormatChanged {
                 expected: frame.sample_rate,
@@ -222,6 +240,19 @@ impl SpeakerRenderer {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let spatial_start = super::decode_timing::start(self.render_timing.enabled);
+        if self.object_output && !stereo {
+            let base_pcm = bridge_frame.basis.base_full_band_pcm.to_vec();
+            let rows = bridge_frame.basis.reconstruction_basis.rows.to_vec();
+            return self.object_block(
+                frame.sample_rate,
+                logical_start_sample,
+                &control,
+                &base_pcm,
+                &rows,
+                calibrated_base.lfe.as_deref(),
+                sample_count,
+            );
+        }
         let mut boundaries = vec![0_usize, sample_count];
         for event in &control.events {
             let start = usize::try_from(event.quantum.saturating_mul(32)).unwrap_or(usize::MAX);
@@ -459,5 +490,132 @@ impl SpeakerRenderer {
         if let Some(linked_gain) = self.final_linked_gain.as_mut() {
             linked_gain.reset();
         }
+    }
+}
+
+// Atmos Edition: object output (signals and positions of the scene's objects,
+// for an external object renderer such as Windows Spatial Sound).
+impl SpeakerRenderer {
+    /// Maximum number of object tracks (plus one LFE track).
+    const MAX_OBJECT_TRACKS: usize = 15;
+
+    #[allow(clippy::too_many_arguments)]
+    fn object_block(
+        &mut self,
+        sample_rate: u32,
+        logical_start_sample: u64,
+        control: &openjoc_scene::BridgeControlFrame,
+        base_pcm: &[Vec<f64>],
+        rows: &[Vec<f64>],
+        lfe: Option<&[f64]>,
+        sample_count: usize,
+    ) -> Result<RenderedBlock, OpenJocError> {
+        use openjoc_scene::{SpatialBindingRecord, SpatialSourceClass};
+
+        let records_now: Vec<SpatialBindingRecord> =
+            self.assembler.records().map(<[_]>::to_vec).unwrap_or_default();
+        // Tracks are chosen once per stream: every coordinate that carries part of
+        // the scene (reconstructed objects, and base channels bound to an object).
+        if self.object_ordinals.is_none() {
+            let ordinals = records_now
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| {
+                    record.active || record.descriptor.source_class != SpatialSourceClass::ExplicitChannel
+                })
+                .map(|(ordinal, _)| ordinal)
+                .take(Self::MAX_OBJECT_TRACKS)
+                .collect::<Vec<_>>();
+            self.object_ordinals = Some(ordinals);
+        }
+        let ordinals = self.object_ordinals.clone().unwrap_or_default();
+        let base_count = base_pcm.len();
+        let signal = |ordinal: usize| -> Option<&Vec<f64>> {
+            if ordinal < base_count {
+                base_pcm.get(ordinal)
+            } else {
+                rows.get(ordinal - base_count)
+            }
+        };
+
+        // State at the start of this frame: the end state of the previous one.
+        let mut state = self.object_state.take().unwrap_or_else(|| records_now.clone());
+        let snapshot = |record: &SpatialBindingRecord, offset: usize| super::OpenJocObjectState {
+            sample_offset: offset,
+            coordinates: record.descriptor.coordinates.clone(),
+            identity: record.descriptor.identity.clone(),
+            gain: record.scalar,
+            active: record.active,
+        };
+        let mut tracks = ordinals
+            .iter()
+            .map(|&ordinal| super::OpenJocObjectTrack {
+                lfe: false,
+                states: state.get(ordinal).map(|r| vec![snapshot(r, 0)]).unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut events = control.events.iter().collect::<Vec<_>>();
+        events.sort_by_key(|event| event.quantum);
+        for event in events {
+            let offset = usize::try_from(event.quantum.saturating_mul(32)).unwrap_or(usize::MAX);
+            let offset = offset.min(sample_count.saturating_sub(1));
+            for update in &event.updates {
+                let Some(record) = state.get_mut(update.ordinal) else { continue };
+                if let Some(descriptor) = &update.descriptor {
+                    if let Some(coordinates) = &descriptor.coordinates {
+                        record.descriptor.coordinates.clone_from(coordinates);
+                    }
+                    if let Some(identity) = &descriptor.identity {
+                        record.descriptor.identity.clone_from(identity);
+                    }
+                    if let Some(class) = &descriptor.source_class {
+                        record.descriptor.source_class = class.clone();
+                    }
+                }
+                if let Some(scalar) = update.scalar {
+                    record.scalar = scalar;
+                }
+                if let Some(active) = update.active {
+                    record.active = active;
+                }
+                if let Some(track) = ordinals.iter().position(|&o| o == update.ordinal) {
+                    let entry = snapshot(record, offset);
+                    let states = &mut tracks[track].states;
+                    if states.last().is_some_and(|last| last.sample_offset == offset) {
+                        states.pop();
+                    }
+                    states.push(entry);
+                }
+            }
+        }
+        // Keep in step with the assembler (authoritative end-of-frame state).
+        self.object_state = Some(if records_now.is_empty() { state } else { records_now });
+
+        let mut channels = ordinals
+            .iter()
+            .map(|&ordinal| {
+                signal(ordinal)
+                    .map(|pcm| pcm[..sample_count.min(pcm.len())].to_vec())
+                    .unwrap_or_else(|| vec![0.0; sample_count])
+            })
+            .collect::<Vec<_>>();
+        for channel in &mut channels {
+            channel.resize(sample_count, 0.0);
+        }
+        let mut lfe_pcm = lfe.map(<[f64]>::to_vec).unwrap_or_else(|| vec![0.0; sample_count]);
+        lfe_pcm.resize(sample_count, 0.0);
+        channels.push(lfe_pcm);
+        tracks.push(super::OpenJocObjectTrack { lfe: true, states: Vec::new() });
+
+        self.object_tracks.push_back(tracks);
+        self.expected_frame = self.expected_frame.saturating_add(1);
+        self.expected_sample = self.expected_sample.saturating_add(sample_count as u64);
+        Ok(RenderedBlock {
+            sample_rate,
+            logical_start_sample,
+            sample_count,
+            channels,
+        })
     }
 }

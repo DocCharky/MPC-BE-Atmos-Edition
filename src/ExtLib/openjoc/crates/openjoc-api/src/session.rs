@@ -185,12 +185,13 @@ impl OpenJocSession {
             ));
         }
         let speaker_layout = config.effective_speaker_layout()?;
-        let speaker = SpeakerRenderer::new_with_linked_gain(
+        let mut speaker = SpeakerRenderer::new_with_linked_gain(
             speaker_layout,
             config.downmix,
             config.render_mode != RenderMode::Binaural,
             config.render_mode != RenderMode::Binaural,
         );
+        speaker.set_object_output(config.object_output && config.render_mode == RenderMode::Speaker);
         let binaural = config
             .binaural
             .as_ref()
@@ -1134,10 +1135,21 @@ impl OpenJocSession {
                 .is_some_and(|state| !state.has_no_tail())
     }
 
-    fn to_pcm_frame(&self, frame: &RenderedBlock) -> Result<OpenJocPcmFrame, OpenJocError> {
+    fn to_pcm_frame(&mut self, frame: &RenderedBlock) -> Result<OpenJocPcmFrame, OpenJocError> {
         let channels = frame.channels.len();
         let samples = frame.sample_count;
-        let (layout_name, labels) = self.output_layout_info();
+        let object_tracks = if self.speaker.object_output() && self.binaural.is_none() {
+            self.speaker.take_object_tracks()
+        } else {
+            None
+        };
+        let (layout_name, labels) = if object_tracks.is_some() {
+            let mut labels = (1..channels).map(|i| format!("Object {i}")).collect::<Vec<_>>();
+            labels.push("LFE".to_owned());
+            ("Objects".to_owned(), labels)
+        } else {
+            self.output_layout_info()
+        };
         if channels != labels.len()
             || frame
                 .channels
@@ -1179,6 +1191,7 @@ impl OpenJocSession {
             sample_count: samples,
             pts_samples,
             interleaved_f32: interleaved,
+            object_tracks,
         })
     }
 

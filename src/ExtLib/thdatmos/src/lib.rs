@@ -235,15 +235,22 @@ impl Ctx {
     fn queue_block(&mut self, b: &eac3::Block) {
         let ch = b.channels.min(MAX_CH);
         let mut done = 0;
+        let mut elements = b.elements;
         while done < b.samples {
             let n = (b.samples - done).min(MAX_SAMPLES);
+            // Element updates up to the start of this frame.
+            for (offset, e) in &b.changes {
+                if *offset <= done {
+                    elements = *e;
+                }
+            }
             let mut f = Box::new(ThdFrame {
                 sample_pos: self.total,
                 samples: n as u32,
                 channels: ch as u32,
                 sample_rate: b.sample_rate,
                 pcm: [[0.0; MAX_CH]; MAX_SAMPLES],
-                elements: b.elements,
+                elements,
             });
             for s in 0..n {
                 let row = &b.pcm[(done + s) * b.channels..];

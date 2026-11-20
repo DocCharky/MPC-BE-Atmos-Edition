@@ -254,6 +254,13 @@ pub struct BridgeControlAssembler {
 }
 
 impl BridgeControlAssembler {
+    /// Atmos Edition: current per-coordinate records (index = coordinate ordinal),
+    /// as left by the last assembled frame.
+    #[must_use]
+    pub fn records(&self) -> Option<&[SpatialBindingRecord]> {
+        self.records.as_deref()
+    }
+
     /// Creates a streaming assembler for one public layout dimension.
     #[must_use]
     pub fn new(capacity: usize, coordinate_dimensions: usize) -> Self {
@@ -697,8 +704,13 @@ fn default_records(
         } else {
             Vec::new()
         };
+        // Atmos Edition: a base channel that no OAMD element is bound to is only
+        // the downmix of the reconstructed objects; rendering it as well counted
+        // every bed signal twice. Bound base channels are activated by their
+        // OAMD updates (subject to `base_projection_enabled`).
+        let _ = base_projection_enabled;
         let (active, scalar) = if *family == CoordinateFamily::Base {
-            (base_projection_enabled, 1.0)
+            (false, 1.0)
         } else {
             (false, 0.0)
         };
