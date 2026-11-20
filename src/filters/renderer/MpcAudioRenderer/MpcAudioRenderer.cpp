@@ -408,11 +408,11 @@ CMpcAudioRenderer::~CMpcAudioRenderer()
 	if (m_hAtmosAbort) {
 		SetEvent(m_hAtmosAbort);
 	}
+	m_pSyncClock->UnSlave(); // before the Atmos audio clock is released
 	m_Atmos.Close();
 	m_VSync.Stop();
 	SAFE_CLOSE_HANDLE(m_hAtmosAbort);
 
-	m_pSyncClock->UnSlave();
 	SAFE_DELETE(m_pSyncClock);
 
 	StopRendererThread();
@@ -644,10 +644,15 @@ HRESULT CMpcAudioRenderer::SetMediaType(const CMediaType *pmt)
 		hr = S_OK;
 	}
 	if (m_bAtmos) {
+		// Leaving the spatial output (e.g. audio track change during playback): the graph clock
+		// must not stay slaved to the spatial stream's audio clock, which is released here.
+		// The WASAPI path slaves it again when its audio client starts.
+		m_pSyncClock->UnSlave();
 		m_Atmos.Close();
 		m_bAtmos = false;
 		m_bSpatialPcm = false;
 		SetSyncSpeed(1.0);
+		AtmosLog(L"SetMediaType: leaving spatial output");
 	}
 
 	if (!m_pAudioClient) {
@@ -3751,7 +3756,7 @@ STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
 	output.Empty();
 	sync.Empty();
 	if (m_bAtmos && m_bSpatialPcm) {
-		output.Format(L"Windows Spatial Sound, PCM with heights \u2192 fixed objects (%u channels)",
+		output.Format(L"Windows Spatial Sound, PCM %u ch \u2192 fixed objects",
 					  m_pWaveFormatExInput ? m_pWaveFormatExInput->nChannels : 0);
 	} else if (m_bAtmos) {
 		const uint32_t info = m_Atmos.GetStreamInfo();
@@ -3868,7 +3873,7 @@ void CMpcAudioRenderer::UpdateSyncSpeed()
 
 	// While measuring (start, after a pause), keep the current speed.
 	double target = bEnabled ? current : 1.0;
-	if (bEnabled && bHz && secs >= 15.0 && bAudio && audioSecs >= 15.0) {
+	if (bEnabled && bHz && secs >= 60.0 && bAudio && audioSecs >= 60.0) { // shorter measurements are too noisy
 		target = 1.0;
 		const double hzAudio = hz / audioRate;
 		const double k = std::floor(hzAudio / m_dVideoFps + 0.5);
