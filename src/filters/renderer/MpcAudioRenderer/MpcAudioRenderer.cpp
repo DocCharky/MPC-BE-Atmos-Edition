@@ -3759,6 +3759,9 @@ STDMETHODIMP_(BOOL) CMpcAudioRenderer::GetVideoSync()
 	return m_bVideoSync;
 }
 
+// Seconds of measurement before the sync correction starts.
+static const double kSyncMeasureSecs = 60.0;
+
 STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
 {
 	output.Empty();
@@ -3788,7 +3791,7 @@ STDMETHODIMP CMpcAudioRenderer::GetAtmosStatus(CString& output, CString& sync)
 		sync = L"Display sync: not possible with bitstream";
 	} else if (m_dVideoFps <= 0.0) {
 		sync = L"Display sync: no video detected";
-	} else if (!bMeasured || !bAudio) {
+	} else if (!bMeasured || !bAudio || secs < kSyncMeasureSecs || audioSecs < kSyncMeasureSecs) {
 		sync.Format(L"%.3f fps, measuring...", m_dVideoFps);
 	} else {
 		sync.Format(L"%.3f fps | %.5f Hz | audio %+.1f ppm | x%.7f", m_dVideoFps, hz, (audioRate - 1.0) * 1e6, GetSyncSpeed());
@@ -3881,7 +3884,7 @@ void CMpcAudioRenderer::UpdateSyncSpeed()
 
 	// While measuring (start, after a pause), keep the current speed.
 	double target = bEnabled ? current : 1.0;
-	if (bEnabled && bHz && secs >= 60.0 && bAudio && audioSecs >= 60.0) { // shorter measurements are too noisy
+	if (bEnabled && bHz && secs >= kSyncMeasureSecs && bAudio && audioSecs >= kSyncMeasureSecs) { // shorter measurements are too noisy
 		target = 1.0;
 		const double hzAudio = hz / audioRate;
 		const double k = std::floor(hzAudio / m_dVideoFps + 0.5);
