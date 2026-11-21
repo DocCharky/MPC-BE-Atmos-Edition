@@ -27,6 +27,8 @@ on:
 jobs:
   build:
     runs-on: windows-2022
+    permissions:
+      contents: write
     timeout-minutes: 60
 
     steps:
@@ -73,3 +75,18 @@ jobs:
         with:
           name: "MPC SpatialClock x64"
           path: out/*
+
+      - name: Draft release (tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dir = "rel/MPC SpatialClock"
+          New-Item -ItemType Directory -Force -Path "$dir/Licenses" | Out-Null
+          Copy-Item out/* $dir/
+          Copy-Item LICENSE.txt "$dir/Licenses/MPC-BE (GPL-3.0).txt"
+          Copy-Item src/ExtLib/openjoc/LICENSE "$dir/Licenses/OpenJOC (Apache-2.0).txt"
+          $zip = "MPC-SpatialClock-${{ github.ref_name }}-x64.zip"
+          Compress-Archive -Path $dir -DestinationPath $zip
+          gh release create "${{ github.ref_name }}" $zip --draft --title "MPC SpatialClock ${{ github.ref_name }}" --notes-file distrib/atmos/release-notes.md
+        shell: pwsh
